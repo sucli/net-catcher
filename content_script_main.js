@@ -1,5 +1,5 @@
 // NetCatcher - Content Script (MAIN world)
-// 在页面上下文中拦截 fetch 和 XMLHttpRequest，通过 postMessage 发送给 ISOLATED world
+// 在页面上下文中拦截 fetch、XMLHttpRequest 和 WebSocket，通过 postMessage 发送给 ISOLATED world
 
 (function() {
   'use strict';
@@ -8,7 +8,6 @@
 
   function sendToBridge(type, data) {
     const msg = { __netCatcher: true, type, data, _reqNum: ++requestCounter };
-    console.log('[NetCatcher MAIN]', type, data.url);
     window.postMessage(msg, '*');
   }
 
@@ -142,5 +141,210 @@
     return originalSend.apply(this, [body]);
   };
 
-  console.log('[NetCatcher] MAIN world interceptor loaded');
+  // 拦截 WebSocket
+  const OriginalWebSocket = window.WebSocket;
+
+  window.WebSocket = function(url, protocols) {
+    const startTime = performance.now();
+    const wsUrl = typeof url === 'string' ? url : url.toString();
+
+    // 生成唯一 ID 标识这个 WebSocket 连接
+    const wsId = ++requestCounter;
+
+    // 发送 WebSocket 连接建立事件
+    sendToBridge('WS_OPEN', {
+      id: wsId,
+      url: wsUrl,
+      startTime,
+      protocols: protocols || null,
+    });
+
+    // 创建原始 WebSocket
+    const ws = protocols ? new OriginalWebSocket(url, protocols) : new OriginalWebSocket(url);
+
+    // 存储原始事件处理器
+    const originalOnMessage = Object.getOwnPropertyDescriptor(WebSocket.prototype, 'onmessage');
+    const originalOnClose = Object.getOwnPropertyDescriptor(WebSocket.prototype, 'onclose');
+    const originalOnError = Object.getOwnPropertyDescriptor(WebSocket.prototype, 'onerror');
+
+    // 拦截 send 方法
+    const originalSend = ws.send.bind(ws);
+    ws.send = function(data) {
+      let messageData = null;
+      let messageType = 'text';
+
+      if (typeof data === 'string') {
+        messageData = data;
+        messageType = 'text';
+      } else if (data instanceof ArrayBuffer) {
+        messageData = '[ArrayBuffer ' + data.byteLength + ' bytes]';
+        messageType = 'binary';
+      } else if (data instanceof Blob) {
+        messageData = '[Blob ' + data.size + ' bytes]';
+        messageType = 'binary';
+      } else if (data instanceof ArrayBufferView) {
+        messageData = '[ArrayBufferView ' + data.byteLength + ' bytes]';
+        messageType = 'binary';
+      } else {
+        try {
+          messageData = String(data);
+        } catch {
+          messageData = '[Unknown data]';
+        }
+      }
+
+      sendToBridge('WS_MESSAGE', {
+        id: wsId,
+        url: wsUrl,
+        direction: 'send',
+        messageType,
+        data: messageData,
+        timestamp: performance.now(),
+      });
+
+      return originalSend(data);
+    };
+
+    // 拦截 onmessage
+    let userOnMessage = null;
+    Object.defineProperty(ws, 'onmessage', {
+      get: () => userOnMessage,
+      set: (handler) => {
+        userOnMessage = handler;
+        if (handler) {
+          ws.addEventListener('message', function(event) {
+            let messageData = null;
+            let messageType = 'text';
+
+            if (typeof event.data === 'string') {
+              messageData = event.data;
+              messageType = 'text';
+            } else if (event.data instanceof ArrayBuffer) {
+              messageData = '[ArrayBuffer ' + event.data.byteLength + ' bytes]';
+              messageType = 'binary';
+            } else if (event.data instanceof Blob) {
+              messageData = '[Blob ' + event.data.size + ' bytes]';
+              messageType = 'binary';
+            } else {
+              try {
+                messageData = String(event.data);
+              } catch {
+                messageData = '[Unknown data]';
+              }
+            }
+
+            sendToBridge('WS_MESSAGE', {
+              id: wsId,
+              url: wsUrl,
+              direction: 'receive',
+              messageType,
+              data: messageData,
+              timestamp: performance.now(),
+            });
+          });
+        }
+      },
+    });
+
+    // 拦截 onclose
+    let userOnClose = null;
+    Object.defineProperty(ws, 'onclose', {
+      get: () => userOnClose,
+      set: (handler) => {
+        userOnClose = handler;
+        if (handler) {
+          ws.addEventListener('close', function(event) {
+            sendToBridge('WS_CLOSE', {
+              id: wsId,
+              url: wsUrl,
+              code: event.code,
+              reason: event.reason,
+              wasClean: event.wasClean,
+              timestamp: performance.now(),
+              startTime,
+            });
+          });
+        }
+      },
+    });
+
+    // 拦截 onerror
+    let userOnError = null;
+    Object.defineProperty(ws, 'onerror', {
+      get: () => userOnError,
+      set: (handler) => {
+        userOnError = handler;
+        if (handler) {
+          ws.addEventListener('error', function() {
+            sendToBridge('WS_ERROR', {
+              id: wsId,
+              url: wsUrl,
+              timestamp: performance.now(),
+              startTime,
+            });
+          });
+        }
+      },
+    });
+
+    // 同时用 addEventListener 监听（以防用户用 addEventListener 而非 onmessage）
+    ws.addEventListener('message', function(event) {
+      let messageData = null;
+      let messageType = 'text';
+
+      if (typeof event.data === 'string') {
+        messageData = event.data;
+        messageType = 'text';
+      } else if (event.data instanceof ArrayBuffer) {
+        messageData = '[ArrayBuffer ' + event.data.byteLength + ' bytes]';
+        messageType = 'binary';
+      } else if (event.data instanceof Blob) {
+        messageData = '[Blob ' + event.data.size + ' bytes]';
+        messageType = 'binary';
+      } else {
+        try { messageData = String(event.data); } catch { messageData = '[Unknown data]'; }
+      }
+
+      sendToBridge('WS_MESSAGE', {
+        id: wsId,
+        url: wsUrl,
+        direction: 'receive',
+        messageType,
+        data: messageData,
+        timestamp: performance.now(),
+      });
+    });
+
+    ws.addEventListener('close', function(event) {
+      sendToBridge('WS_CLOSE', {
+        id: wsId,
+        url: wsUrl,
+        code: event.code,
+        reason: event.reason,
+        wasClean: event.wasClean,
+        timestamp: performance.now(),
+        startTime,
+      });
+    });
+
+    ws.addEventListener('error', function() {
+      sendToBridge('WS_ERROR', {
+        id: wsId,
+        url: wsUrl,
+        timestamp: performance.now(),
+        startTime,
+      });
+    });
+
+    return ws;
+  };
+
+  // 复制原始 WebSocket 的静态属性
+  window.WebSocket.CONNECTING = OriginalWebSocket.CONNECTING;
+  window.WebSocket.OPEN = OriginalWebSocket.OPEN;
+  window.WebSocket.CLOSING = OriginalWebSocket.CLOSING;
+  window.WebSocket.CLOSED = OriginalWebSocket.CLOSED;
+  window.WebSocket.prototype = OriginalWebSocket.prototype;
+
+  console.log('[NetCatcher] MAIN world interceptor loaded (fetch + XHR + WebSocket)');
 })();

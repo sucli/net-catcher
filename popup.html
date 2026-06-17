@@ -11,7 +11,10 @@
   <div class="toolbar">
     <div class="toolbar-left">
       <span class="logo">🔍 NetCatcher</span>
-      <span id="count" class="count">0 条请求</span>
+      <div class="tab-group">
+        <button id="tab-http" class="tab-btn active" data-view="http">HTTP <span id="http-count">0</span></button>
+        <button id="tab-ws" class="tab-btn" data-view="ws">WebSocket <span id="ws-count">0</span></button>
+      </div>
     </div>
     <div class="toolbar-right">
       <button id="btn-toggle" class="btn btn-green" title="暂停/恢复">⏸ 暂停</button>
@@ -24,7 +27,7 @@
     </div>
   </div>
 
-  <!-- 请求统计栏 -->
+  <!-- HTTP 请求统计栏 -->
   <div class="stats-bar" id="stats-bar">
     <span class="stat stat-total"><b id="stat-total">0</b> 总计</span>
     <span class="stat stat-2xx"><b id="stat-2xx">0</b> 成功</span>
@@ -36,7 +39,7 @@
   </div>
 
   <!-- 过滤栏 -->
-  <div class="filter-bar">
+  <div class="filter-bar" id="filter-bar">
     <input type="text" id="filter-url" placeholder="🔍 搜索 URL..." class="filter-input">
     <select id="filter-method" class="filter-select">
       <option value="">全部方法</option>
@@ -66,7 +69,7 @@
     </select>
   </div>
 
-  <!-- 请求列表 -->
+  <!-- HTTP 请求列表 -->
   <div class="request-list" id="request-list">
     <div class="empty-state" id="empty-state">
       <div class="empty-icon">📡</div>
@@ -75,7 +78,16 @@
     </div>
   </div>
 
-  <!-- 详情面板 -->
+  <!-- WebSocket 连接列表 -->
+  <div class="ws-list" id="ws-list" style="display:none">
+    <div class="empty-state" id="ws-empty-state">
+      <div class="empty-icon">🔌</div>
+      <div>等待 WebSocket 连接...</div>
+      <div class="empty-hint">页面建立 WebSocket 连接后会自动捕获</div>
+    </div>
+  </div>
+
+  <!-- HTTP 详情面板 -->
   <div class="detail-overlay" id="detail-overlay" style="display:none">
     <div class="detail-panel">
       <div class="detail-header">
@@ -94,6 +106,23 @@
         <div id="tab-headers" class="tab-content active"></div>
         <div id="tab-request" class="tab-content"></div>
         <div id="tab-response" class="tab-content"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- WebSocket 详情面板 -->
+  <div class="detail-overlay" id="ws-detail-overlay" style="display:none">
+    <div class="detail-panel ws-detail-panel">
+      <div class="detail-header">
+        <span id="ws-detail-title">WebSocket 详情</span>
+        <div class="detail-actions">
+          <button id="btn-ws-export" class="btn btn-blue" title="导出消息">📥 导出</button>
+          <button id="btn-close-ws-detail" class="btn-close">✕</button>
+        </div>
+      </div>
+      <div class="ws-info" id="ws-info"></div>
+      <div class="ws-messages-container">
+        <div class="ws-messages" id="ws-messages"></div>
       </div>
     </div>
   </div>

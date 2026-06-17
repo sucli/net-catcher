@@ -4,20 +4,13 @@
 (function() {
   'use strict';
 
-  console.log('[NetCatcher] Bridge script loaded');
-
   window.addEventListener('message', function(event) {
     if (event.source !== window) return;
     if (!event.data || !event.data.__netCatcher) return;
 
     const { type, data } = event.data;
-    console.log('[NetCatcher BRIDGE] Received:', type, data.url);
 
-    // 直接转发给 background，不等待响应
-    chrome.runtime.sendMessage({ type, data }).then(() => {
-      console.log('[NetCatcher BRIDGE] Sent to background:', type);
-    }).catch(err => {
-      console.error('[NetCatcher BRIDGE] Send failed:', err.message);
-    });
+    // 转发所有消息类型，包括 WebSocket 相关
+    chrome.runtime.sendMessage({ type, data }).catch(() => {});
   });
 })();
