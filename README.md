@@ -5,6 +5,7 @@
 ## 功能特性
 
 - 🔍 **捕获网络请求**：拦截 fetch 和 XMLHttpRequest
+- 🔌 **WebSocket 抓包**：捕获 WebSocket 连接和消息
 - 📋 **请求详情**：查看 Headers、请求体、响应体
 - 🔎 **过滤搜索**：按 URL、HTTP 方法、状态码过滤
 - 📊 **请求统计**：2xx / 3xx / 4xx / 5xx 数量统计
@@ -39,13 +40,28 @@ git clone https://github.com/sucli/net-catcher.git
 2. 弹窗会显示当前页面捕获的网络请求
 3. 在页面上触发操作（点击按钮、刷新页面等），请求会实时显示
 
+### 切换视图
+
+弹窗顶部有 **HTTP** 和 **WebSocket** 两个标签页：
+- **HTTP**：显示 fetch 和 XMLHttpRequest 请求
+- **WebSocket**：显示 WebSocket 连接和消息
+
 ### 查看请求详情
 
-点击任意一条请求，可以查看：
+点击任意一条 HTTP 请求，可以查看：
 
 - **Headers**：请求头和响应头
 - **请求体**：POST / PUT 请求的 body
 - **响应体**：服务器返回的内容
+
+### 查看 WebSocket 详情
+
+点击任意一条 WebSocket 连接，可以查看：
+
+- **连接信息**：URL、状态、协议、关闭代码等
+- **消息列表**：所有发送和接收的消息
+- **消息方向**：蓝色表示发送（↑），绿色表示接收（↓）
+- **导出消息**：点击「📥 导出」保存为 JSON 文件
 
 ### 过滤和搜索
 
@@ -76,7 +92,7 @@ git clone https://github.com/sucli/net-catcher.git
 | XMLHttpRequest | ✅ | 通过拦截 `XHR.prototype` |
 | 页面跳转 | ❌ | 整页刷新会丢失状态 |
 | 静态资源 | ❌ | 图片、脚本、CSS 等 |
-| WebSocket | ❌ | 需要额外实现 |
+| WebSocket | ✅ | 捕获连接、消息收发、关闭事件 |
 
 > 💡 如果需要捕获页面跳转或静态资源，建议使用 Chrome DevTools 的 Network 面板。
 
