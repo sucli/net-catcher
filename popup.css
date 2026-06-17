@@ -302,12 +302,23 @@ body {
 .detail-actions { display: flex; align-items: center; gap: 6px; }
 .btn-close {
   background: none;
-  border: none;
-  color: #888;
-  font-size: 15px;
+  border: 1px solid #666;
+  color: #ccc;
+  font-size: 14px;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   cursor: pointer;
+  border-radius: 4px;
+  transition: all 0.2s;
 }
-.btn-close:hover { color: #e74c3c; }
+.btn-close:hover {
+  color: #fff;
+  background: #e74c3c;
+  border-color: #e74c3c;
+}
 
 .detail-tabs {
   display: flex;
