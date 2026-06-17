@@ -74,6 +74,17 @@ function matchMockRule(url) {
   });
 }
 
+// 生成 Mock 响应
+function getMockResponse(url) {
+  const rule = matchMockRule(url);
+  if (!rule) return null;
+  return {
+    status: rule.status,
+    headers: rule.headers,
+    body: rule.body,
+  };
+}
+
 // 消息处理
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // ============ HTTP 请求相关 ============
@@ -86,6 +97,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse(null);
       return;
     }
+
+    // 检查是否有匹配的 Mock 规则
+    const mockResponse = getMockResponse(msg.data.url);
 
     const entry = {
       id: ++requestId,
@@ -105,14 +119,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       tabId: sender.tab ? sender.tab.id : null,
       starred: false,
       tags: [],
+      isMocked: !!mockResponse,
     };
     requests.push(entry);
     if (requests.length > MAX_REQUESTS) {
       requests = requests.slice(-MAX_REQUESTS);
     }
+
+    // 如果有 Mock 规则，立即返回 mock 响应
+    if (mockResponse) {
+      entry.status = mockResponse.status;
+      entry.statusText = 'Mocked';
+      entry.responseHeaders = mockResponse.headers || {};
+      entry.responseBody = mockResponse.body;
+      entry.endTime = msg.data.startTime + 1; // 模拟 1ms 响应
+      entry.duration = 1;
+      entry.size = mockResponse.body ? mockResponse.body.length : 0;
+    }
+
     persist();
     broadcastUpdate();
-    sendResponse({ id: entry.id });
+    sendResponse({ id: entry.id, mocked: !!mockResponse });
     return true;
   }
 

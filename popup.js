@@ -152,6 +152,7 @@ function bindEvents() {
     const id = parseInt(e.target.value);
     if (!id) return;
     chrome.runtime.sendMessage({ type: 'GET_FILTERS' }, (res) => {
+      if (chrome.runtime.lastError || !res) return;
       const filter = res.filters.find(f => f.id === id);
       if (filter && filter.config) {
         document.getElementById('filter-url').value = filter.config.url || '';
@@ -327,9 +328,10 @@ function renderFlatRequests(list, requests) {
   const html = requests.map(r => {
     const selected = selectedIds.has(r.id) ? ' selected' : '';
     const starred = r.starred ? ' ⭐' : '';
+    const mocked = r.isMocked ? ' 🎭' : '';
     return `<div class="request-item${selected}" data-id="${r.id}">
       <span class="req-method method-${r.method}">${r.method}</span>
-      <span class="req-url" title="${escapeHtml(r.url)}">${escapeHtml(getShortUrl(r.url))}${starred}</span>
+      <span class="req-url" title="${escapeHtml(r.url)}">${escapeHtml(getShortUrl(r.url))}${starred}${mocked}</span>
       <span class="req-status ${r.status ? getStatusClass(r.status) : 'status-0'}">${r.status || '---'}</span>
       <span class="req-duration">${r.duration ? Math.round(r.duration) + 'ms' : '...'}</span>
       <span class="req-size">${r.size ? formatSize(r.size) : '...'}</span>
@@ -488,16 +490,16 @@ function generateDiff(text1, text2) {
 // ============ 时间线视图 ============
 
 function renderTimeline() {
-  const filtered = filterAndSortRequests(allRequests);
+  const filtered = filterAndSortRequests(allRequests).filter(r => r.endTime);
   const container = document.getElementById('timeline-container');
 
   if (filtered.length === 0) {
-    container.innerHTML = '<div class="empty-state"><div class="empty-icon">📊</div><div>暂无数据</div></div>';
+    container.innerHTML = '<div class="empty-state"><div class="empty-icon">📊</div><div>暂无已完成的请求</div><div class="empty-hint">等待请求完成或刷新页面</div></div>';
     return;
   }
 
   const minTime = Math.min(...filtered.map(r => r.startTime));
-  const maxTime = Math.max(...filtered.map(r => r.endTime || r.startTime));
+  const maxTime = Math.max(...filtered.map(r => r.endTime));
   const totalDuration = maxTime - minTime || 1;
 
   let html = '<div class="timeline-header">';
