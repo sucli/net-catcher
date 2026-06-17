@@ -1,150 +1,106 @@
 # NetCatcher
 
-一个轻量级的 Chrome 网络请求抓包扩展，用于捕获和检查网页的 fetch / XMLHttpRequest 请求。
+一个功能强大的 Chrome 网络请求抓包扩展，支持 HTTP 请求捕获、WebSocket 抓包、请求重放、Mock 响应、时间线分析等功能。
 
 ## 功能特性
 
-- 🔍 **捕获网络请求**：拦截 fetch 和 XMLHttpRequest
-- 🔌 **WebSocket 抓包**：捕获 WebSocket 连接和消息
-- 📋 **请求详情**：查看 Headers、请求体、响应体
-- 🔎 **过滤搜索**：按 URL、HTTP 方法、状态码过滤
-- 📊 **请求统计**：2xx / 3xx / 4xx / 5xx 数量统计
-- 📥 **导出 HAR**：导出为标准 HAR 格式文件
-- 📋 **复制 cURL**：一键复制为 cURL 命令
-- ⏸ **暂停/恢复**：随时暂停或恢复抓包
-- 💾 **持久化存储**：关闭弹窗后数据不丢失
+### 🔍 请求捕获
+- 拦截 fetch 和 XMLHttpRequest
+- 捕获 WebSocket 连接和消息
+- 显示请求/响应详情（Headers、Body）
+- 响应预览（JSON、HTML、图片）
 
-## 安装方式
+### 🔄 请求重放
+- 一键重发请求，方便接口调试
+- 查看重放结果（状态码、响应内容）
 
-### 1. 下载代码
+### 🎭 Mock 响应
+- 自定义 URL 匹配规则（支持正则）
+- 返回自定义状态码、Headers、Body
+- 快速启用/禁用规则
+
+### 📊 时间线分析
+- 甘特图展示请求时间分布
+- 识别串行/并行请求
+- 分析页面加载瓶颈
+
+### 🔎 过滤与搜索
+- 按 URL、HTTP 方法、状态码、类型过滤
+- 保存/加载常用过滤器
+- 请求分组（按域名折叠）
+
+### ⚡ 性能优化
+- 请求去重（避免轮询刷屏）
+- WebSocket 消息数量限制
+- 内存自动清理
+
+### 📋 其他功能
+- 请求对比（Ctrl+Click 多选两个请求）
+- 导出 HAR 文件
+- 复制 cURL 命令
+- 收藏重要请求
+- 键盘快捷键
+
+## 安装
 
 ```bash
 git clone https://github.com/sucli/net-catcher.git
 ```
 
-或者直接下载 ZIP 压缩包解压。
-
-### 2. 加载到 Chrome
-
-1. 打开 Chrome 浏览器，地址栏输入 `chrome://extensions`
-2. 开启右上角的 **「开发者模式」**
-3. 点击 **「加载已解压的扩展程序」**
-4. 选择下载的 `net-catcher` 文件夹
-5. 扩展图标会出现在浏览器工具栏
+1. 打开 `chrome://extensions`
+2. 开启「开发者模式」
+3. 点击「加载已解压的扩展程序」
+4. 选择 `net-catcher` 文件夹
 
 ## 使用方式
 
-### 基本使用
+### 基本操作
 
-1. 点击浏览器工具栏的 **NetCatcher** 图标
-2. 弹窗会显示当前页面捕获的网络请求
-3. 在页面上触发操作（点击按钮、刷新页面等），请求会实时显示
+| 操作 | 说明 |
+|------|------|
+| 点击图标 | 打开弹窗查看请求 |
+| 点击请求 | 查看详情 |
+| Ctrl + 点击 | 多选请求（选 2 个自动对比） |
+| ↑ / ↓ 键 | 快速切换请求 |
+| Esc | 关闭弹窗 |
 
-### 切换视图
+### 视图切换
 
-弹窗顶部有 **HTTP** 和 **WebSocket** 两个标签页：
-- **HTTP**：显示 fetch 和 XMLHttpRequest 请求
-- **WebSocket**：显示 WebSocket 连接和消息
+弹窗顶部有 4 个标签页：
+- **HTTP**：显示 fetch/XHR 请求列表
+- **WS**：显示 WebSocket 连接
+- **时间线**：瀑布图展示请求时间
+- **Mock**：管理 Mock 规则
 
-### 查看请求详情
+### 请求重放
 
-点击任意一条 HTTP 请求，可以查看：
+1. 点击选中一个请求
+2. 点击详情面板的「🔄 重放」按钮
+3. 切换到「重放结果」标签查看响应
 
-- **Headers**：请求头和响应头
-- **请求体**：POST / PUT 请求的 body
-- **响应体**：服务器返回的内容
+### Mock 响应
 
-### 查看 WebSocket 详情
+1. 切换到「Mock」标签页
+2. 点击「+ 添加规则」
+3. 填写 URL 匹配模式和自定义响应
+4. 开启规则后，匹配的请求将返回自定义内容
 
-点击任意一条 WebSocket 连接，可以查看：
+### 过滤器
 
-- **连接信息**：URL、状态、协议、关闭代码等
-- **消息列表**：所有发送和接收的消息
-- **消息方向**：蓝色表示发送（↑），绿色表示接收（↓）
-- **导出消息**：点击「📥 导出」保存为 JSON 文件
+1. 设置过滤条件（URL、方法、状态码等）
+2. 点击「💾」按钮保存
+3. 从下拉菜单快速加载已保存的过滤器
 
-### 过滤和搜索
-
-- **URL 搜索**：输入关键词过滤请求
-- **HTTP 方法**：按 GET / POST / PUT / DELETE 等筛选
-- **状态码**：按 2xx / 3xx / 4xx / 5xx 筛选
-- **排序**：按时间、耗时、大小排序
-
-### 导出数据
-
-- **导出 HAR**：点击「📥 导出」按钮，下载为 `.har` 文件，可导入 Chrome DevTools
-- **复制 cURL**：在请求详情中点击「📋 复制 cURL」，粘贴到终端直接执行
-
-### 快捷键
-
-在弹窗打开时：
-
-- `↑` / `↓`：选择上一条/下一条请求
-- `Enter`：打开选中请求的详情
-- `Esc`：关闭详情面板
-- `Ctrl+C` / `⌘+C`：复制选中请求的 cURL 命令
-
-## 能捕获什么
-
-| 类型 | 能否捕获 | 说明 |
-|------|---------|------|
-| fetch 请求 | ✅ | 通过拦截 `window.fetch` |
-| XMLHttpRequest | ✅ | 通过拦截 `XHR.prototype` |
-| 页面跳转 | ❌ | 整页刷新会丢失状态 |
-| 静态资源 | ❌ | 图片、脚本、CSS 等 |
-| WebSocket | ✅ | 捕获连接、消息收发、关闭事件 |
-
-> 💡 如果需要捕获页面跳转或静态资源，建议使用 Chrome DevTools 的 Network 面板。
-
-## 技术实现
-
-采用**双脚本架构**解决 Manifest V3 的限制：
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  页面 (MAIN world)                                       │
-│  content_script_main.js                                  │
-│  - 拦截 fetch / XMLHttpRequest                           │
-│  - 通过 postMessage 发送数据                              │
-└─────────────────────┬───────────────────────────────────┘
-                      │ window.postMessage
-                      ▼
-┌─────────────────────────────────────────────────────────┐
-│  Content Script (ISOLATED world)                         │
-│  content_script_bridge.js                                │
-│  - 监听 postMessage                                      │
-│  - 通过 chrome.runtime.sendMessage 转发                   │
-└─────────────────────┬───────────────────────────────────┘
-                      │ chrome.runtime.sendMessage
-                      ▼
-┌─────────────────────────────────────────────────────────┐
-│  Background (Service Worker)                             │
-│  background.js                                           │
-│  - 存储请求数据                                           │
-│  - 匹配请求和响应                                         │
-│  - 通知 popup 更新                                        │
-└─────────────────────────────────────────────────────────┘
-```
-
-### 为什么需要双脚本？
-
-Chrome 扩展的 Content Script 有两个运行世界：
-
-- **MAIN world**：可以访问页面的 JS（拦截 fetch/XHR），但不能使用扩展 API
-- **ISOLATED world**：可以使用扩展 API（chrome.runtime），但无法拦截页面代码
-
-为了同时实现「拦截请求」和「发送消息给 background」，需要两个脚本配合工作。
-
-## 项目结构
+## 文件结构
 
 ```
 net-catcher/
 ├── manifest.json              # 扩展配置
-├── background.js              # Service Worker
-├── content_script_main.js     # MAIN world - 拦截请求
-├── content_script_bridge.js   # ISOLATED world - 消息中转
+├── background.js              # Service Worker（核心逻辑）
+├── content_script_main.js     # MAIN world（拦截 fetch/XHR/WebSocket）
+├── content_script_bridge.js   # ISOLATED world（消息中转）
 ├── popup.html                 # 弹窗页面
-├── popup.js                   # 弹窗逻辑
+├── popup.js                   # 弹窗逻辑（~1000 行）
 ├── popup.css                  # 样式
 ├── README.md                  # 说明文档
 └── icons/
@@ -153,34 +109,48 @@ net-catcher/
     └── icon128.svg
 ```
 
-## 常见问题
+## 技术亮点
 
-### Q: 打开弹窗后没有显示任何请求？
+### 双脚本架构
 
-A: 确保：
-1. 扩展已正确加载（chrome://extensions 页面显示绿色开关）
-2. 在当前页面触发了网络请求（刷新页面、点击按钮等）
-3. 检查是否有报错（点击「错误」按钮查看）
+Chrome MV3 的 Content Script 有两种 world：
+- **MAIN world**：能拦截页面 JS，但不能用扩展 API
+- **ISOLATED world**：能用扩展 API，但不能拦截页面 JS
 
-### Q: 某些请求没有被捕获？
+解决方案：两个脚本配合
+- `content_script_main.js`（MAIN）拦截请求 → `postMessage`
+- `content_script_bridge.js`（ISOLATED）接收 → `chrome.runtime.sendMessage`
 
-A: 可能的原因：
-- 页面跳转（整页刷新）无法捕获
-- 静态资源（图片、CSS、JS）无法捕获
-- WebSocket 连接无法捕获
-- 某些使用 Service Worker 的请求可能无法捕获
+### 请求去重
 
-### Q: 数据会保存多久？
+同一 URL 短时间内多次请求（如轮询），自动去重避免刷屏：
 
-A: 数据存储在浏览器本地，最多保存 500 条请求。关闭浏览器后数据不会丢失，但建议重要数据及时导出 HAR 文件。
+```javascript
+function isDuplicateRequest(url, startTime) {
+  const threshold = 50; // 50ms
+  return requests.some(r =>
+    r.url === url &&
+    Math.abs(r.startTime - startTime) < threshold
+  );
+}
+```
 
-## 开发相关
+### 时间线可视化
 
-本地开发和调试：
+用 CSS 定位实现瀑布图：
+- 计算请求的相对起始时间和持续时间
+- 转换为百分比定位
+- 颜色编码表示状态
 
-1. 修改代码后，去 `chrome://extensions` 点击扩展的刷新按钮
-2. 查看 Service Worker 日志：点击「Service Worker」链接
-3. 查看弹窗日志：在弹窗内右键 → 检查
+## 版本历史
+
+| 版本 | 日期 | 更新内容 |
+|------|------|---------|
+| 2.0.0 | 2026-06-17 | 重放、Mock、时间线、对比、分组、过滤器保存 |
+| 1.2.0 | 2026-06-17 | WebSocket 抓包 |
+| 1.1.1 | 2026-06-17 | 修复列表渲染 Bug |
+| 1.1.0 | 2026-06-17 | 侧边栏模式（已移除）|
+| 1.0.0 | 2026-06-16 | 初始版本 |
 
 ## 许可证
 

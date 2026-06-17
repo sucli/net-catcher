@@ -1,19 +1,26 @@
 // NetCatcher - Background Service Worker
-// 接收 content script 发来的请求数据，存储并转发给 popup
+// 核心功能：请求捕获、存储、重放、Mock、过滤器管理
 
 const MAX_REQUESTS = 500;
 const MAX_WS_CONNECTIONS = 100;
-const MAX_WS_MESSAGES_PER_CONNECTION = 200;
+const MAX_WS_MESSAGES = 200;
 let requests = [];
-let wsConnections = new Map(); // id -> { ...connection, messages: [] }
+let wsConnections = new Map();
 let isCapturing = true;
 let requestId = 0;
+let mockRules = [];
+let savedFilters = [];
 
-// 从持久化存储恢复数据
-chrome.storage.local.get(['nc_requests', 'nc_wsConnections', 'nc_requestId', 'nc_isCapturing'], (data) => {
+// 初始化：从存储恢复数据
+chrome.storage.local.get([
+  'nc_requests', 'nc_wsConnections', 'nc_requestId', 'nc_isCapturing',
+  'nc_mockRules', 'nc_savedFilters'
+], (data) => {
   if (data.nc_requests) requests = data.nc_requests;
   if (data.nc_requestId) requestId = data.nc_requestId;
   if (data.nc_isCapturing !== undefined) isCapturing = data.nc_isCapturing;
+  if (data.nc_mockRules) mockRules = data.nc_mockRules;
+  if (data.nc_savedFilters) savedFilters = data.nc_savedFilters;
   if (data.nc_wsConnections) {
     try {
       const arr = JSON.parse(data.nc_wsConnections);
@@ -22,27 +29,64 @@ chrome.storage.local.get(['nc_requests', 'nc_wsConnections', 'nc_requestId', 'nc
   }
 });
 
-// 保存到持久化存储
+// 持久化存储
 function persist() {
+  // 内存优化：限制 WebSocket 消息数量
   const wsArr = Array.from(wsConnections.values()).slice(-20);
   wsArr.forEach(conn => {
-    conn.messages = conn.messages.slice(-50); // 只持久化最近50条消息
+    if (conn.messages.length > MAX_WS_MESSAGES) {
+      conn.messages = conn.messages.slice(-MAX_WS_MESSAGES);
+    }
   });
+
   chrome.storage.local.set({
     nc_requests: requests.slice(-200),
     nc_wsConnections: JSON.stringify(wsArr),
     nc_requestId: requestId,
     nc_isCapturing: isCapturing,
+    nc_mockRules: mockRules,
+    nc_savedFilters: savedFilters,
   });
 }
 
-// 监听来自 content script 和 popup 的消息
+// 请求去重：检查是否是重复请求
+function isDuplicateRequest(url, startTime) {
+  const threshold = 50; // 50ms 内的相同 URL 视为重复
+  return requests.some(r =>
+    r.url === url &&
+    Math.abs(r.startTime - startTime) < threshold &&
+    r.endTime === null
+  );
+}
+
+// 匹配 Mock 规则
+function matchMockRule(url) {
+  return mockRules.find(rule => {
+    if (!rule.enabled) return false;
+    if (rule.isRegex) {
+      try {
+        return new RegExp(rule.pattern).test(url);
+      } catch {
+        return false;
+      }
+    }
+    return url.includes(rule.pattern);
+  });
+}
+
+// 消息处理
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // ============ HTTP 请求相关 ============
+
   if (msg.type === 'NET_REQUEST') {
-    if (!isCapturing) {
+    if (!isCapturing) { sendResponse(null); return; }
+
+    // 请求去重
+    if (isDuplicateRequest(msg.data.url, msg.data.startTime)) {
       sendResponse(null);
       return;
     }
+
     const entry = {
       id: ++requestId,
       url: msg.data.url,
@@ -59,6 +103,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       size: null,
       type: msg.data.type || 'xhr',
       tabId: sender.tab ? sender.tab.id : null,
+      starred: false,
+      tags: [],
     };
     requests.push(entry);
     if (requests.length > MAX_REQUESTS) {
@@ -109,50 +155,43 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // WebSocket 事件处理
+  // ============ WebSocket 相关 ============
+
   if (msg.type === 'WS_OPEN') {
-    if (!isCapturing) {
-      sendResponse(null);
-      return;
-    }
-    const wsId = msg.data.id;
+    if (!isCapturing) { sendResponse(null); return; }
     const conn = {
-      id: wsId,
+      id: msg.data.id,
       url: msg.data.url,
       protocols: msg.data.protocols,
       startTime: msg.data.startTime,
       tabId: sender.tab ? sender.tab.id : null,
-      status: 'open', // open, closed, error
+      status: 'open',
       closeCode: null,
       closeReason: '',
       endTime: null,
       messages: [],
       messageCount: { send: 0, receive: 0 },
     };
-    wsConnections.set(wsId, conn);
+    wsConnections.set(msg.data.id, conn);
     if (wsConnections.size > MAX_WS_CONNECTIONS) {
       const oldestKey = wsConnections.keys().next().value;
       wsConnections.delete(oldestKey);
     }
     persist();
     broadcastUpdate();
-    sendResponse({ id: wsId });
+    sendResponse({ id: msg.data.id });
     return true;
   }
 
   if (msg.type === 'WS_MESSAGE') {
     const conn = wsConnections.get(msg.data.id);
     if (conn) {
-      const message = {
-        direction: msg.data.direction, // 'send' or 'receive'
-        type: msg.data.messageType,    // 'text' or 'binary'
+      conn.messages.push({
+        direction: msg.data.direction,
+        type: msg.data.messageType,
         data: msg.data.data,
         timestamp: msg.data.timestamp,
-      };
-      conn.messages.push(message);
-      if (conn.messages.length > MAX_WS_MESSAGES_PER_CONNECTION) {
-        conn.messages = conn.messages.slice(-MAX_WS_MESSAGES_PER_CONNECTION);
-      }
+      });
       conn.messageCount[msg.data.direction]++;
       persist();
       broadcastUpdate();
@@ -190,11 +229,125 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // ============ 请求重放 ============
+
+  if (msg.type === 'REPLAY_REQUEST') {
+    const req = requests.find(r => r.id === msg.data.id);
+    if (!req) {
+      sendResponse({ error: '请求不存在' });
+      return true;
+    }
+
+    // 在 Service Worker 中执行 fetch
+    const fetchOptions = {
+      method: req.method,
+      headers: req.requestHeaders,
+    };
+    if (req.requestBody && ['POST', 'PUT', 'PATCH'].includes(req.method)) {
+      fetchOptions.body = req.requestBody;
+    }
+
+    fetch(req.url, fetchOptions)
+      .then(async response => {
+        const body = await response.text();
+        sendResponse({
+          ok: true,
+          status: response.status,
+          statusText: response.statusText,
+          headers: Object.fromEntries(response.headers.entries()),
+          body: body,
+        });
+      })
+      .catch(err => {
+        sendResponse({ error: err.message });
+      });
+    return true; // 异步响应
+  }
+
+  // ============ Mock 规则管理 ============
+
+  if (msg.type === 'GET_MOCK_RULES') {
+    sendResponse({ rules: mockRules });
+    return true;
+  }
+
+  if (msg.type === 'ADD_MOCK_RULE') {
+    mockRules.push({
+      id: Date.now(),
+      name: msg.data.name || '',
+      pattern: msg.data.pattern,
+      isRegex: msg.data.isRegex || false,
+      enabled: true,
+      status: msg.data.status || 200,
+      headers: msg.data.headers || { 'content-type': 'application/json' },
+      body: msg.data.body || '{}',
+    });
+    persist();
+    broadcastUpdate();
+    sendResponse({ ok: true, rules: mockRules });
+    return true;
+  }
+
+  if (msg.type === 'UPDATE_MOCK_RULE') {
+    const rule = mockRules.find(r => r.id === msg.data.id);
+    if (rule) {
+      Object.assign(rule, msg.data);
+      persist();
+    }
+    sendResponse({ ok: true, rules: mockRules });
+    return true;
+  }
+
+  if (msg.type === 'DELETE_MOCK_RULE') {
+    mockRules = mockRules.filter(r => r.id !== msg.data.id);
+    persist();
+    sendResponse({ ok: true, rules: mockRules });
+    return true;
+  }
+
+  if (msg.type === 'TOGGLE_MOCK_RULE') {
+    const rule = mockRules.find(r => r.id === msg.data.id);
+    if (rule) {
+      rule.enabled = !rule.enabled;
+      persist();
+    }
+    sendResponse({ ok: true, rules: mockRules });
+    return true;
+  }
+
+  // ============ 过滤器管理 ============
+
+  if (msg.type === 'GET_FILTERS') {
+    sendResponse({ filters: savedFilters });
+    return true;
+  }
+
+  if (msg.type === 'SAVE_FILTER') {
+    savedFilters.push({
+      id: Date.now(),
+      name: msg.data.name,
+      config: msg.data.config,
+    });
+    persist();
+    sendResponse({ ok: true, filters: savedFilters });
+    return true;
+  }
+
+  if (msg.type === 'DELETE_FILTER') {
+    savedFilters = savedFilters.filter(f => f.id !== msg.data.id);
+    persist();
+    sendResponse({ ok: true, filters: savedFilters });
+    return true;
+  }
+
+  // ============ 通用操作 ============
+
   if (msg.type === 'GET_REQUESTS') {
     sendResponse({
       requests,
       wsConnections: Array.from(wsConnections.values()),
       isCapturing,
+      mockRules,
     });
     return true;
   }
@@ -217,6 +370,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     wsConnections.clear();
     requestId = 0;
     persist();
+    broadcastUpdate();
     sendResponse({ ok: true });
     return true;
   }
@@ -224,6 +378,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'EXPORT_HAR') {
     const har = generateHAR(requests);
     sendResponse({ har });
+    return true;
+  }
+
+  if (msg.type === 'TOGGLE_STAR') {
+    const req = requests.find(r => r.id === msg.data.id);
+    if (req) {
+      req.starred = !req.starred;
+      persist();
+      broadcastUpdate();
+    }
+    sendResponse({ ok: true });
     return true;
   }
 });
@@ -260,17 +425,13 @@ function generateHAR(requests) {
       bodySize: r.size || 0,
     },
     cache: {},
-    timings: {
-      send: 0,
-      wait: r.duration || 0,
-      receive: 0,
-    },
+    timings: { send: 0, wait: r.duration || 0, receive: 0 },
   }));
 
   return {
     log: {
       version: '1.2',
-      creator: { name: 'NetCatcher', version: '1.2.0' },
+      creator: { name: 'NetCatcher', version: '2.0.0' },
       entries,
     },
   };
