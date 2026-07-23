@@ -95,6 +95,7 @@ function loadMainScript({ responder, fetchImpl = async () => new Response('ok') 
     ArrayBuffer,
     TextDecoder,
     TextEncoder,
+    URL,
     Event,
     ProgressEvent: FakeProgressEvent,
     crypto,
@@ -196,6 +197,27 @@ test('fetch resolves before asynchronous response-body capture finishes', async 
   releaseBody({ done: true });
 });
 
+test('fetch does not wait for the bridge when no mock rules are active', async () => {
+  let networkCalls = 0;
+  const { window } = loadMainScript({
+    fetchImpl: async () => {
+      networkCalls += 1;
+      return new Response('network');
+    },
+  });
+  window.location = { href: 'https://example.test/page' };
+  window.emitMessage({ __netCatcherConfig: true, hasActiveMockRules: false });
+
+  const response = await Promise.race([
+    window.fetch('/fast'),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('fetch waited for bridge')), 50)),
+  ]);
+  assert.equal(networkCalls, 1);
+  assert.equal(await response.text(), 'network');
+  const request = window.messages.find(message => message.type === 'NET_REQUEST');
+  assert.equal(request.data.url, 'https://example.test/fast');
+});
+
 test('XMLHttpRequest mock completes without issuing the network request', async () => {
   const { XMLHttpRequest } = loadMainScript({
     responder: message => message.type === 'NET_REQUEST' ? {
@@ -237,6 +259,8 @@ test('WebSocket page handlers still run and capture IDs use absolute time', () =
   assert.equal(typeof open.data.id, 'string');
   assert.ok(open.data.startTime > 1_600_000_000_000);
   assert.equal(window.messages.filter(message => message.type === 'WS_MESSAGE').length, 1);
+  socket.dispatchEvent(new Event('open'));
+  assert.equal(window.messages.filter(message => message.type === 'WS_READY').length, 1);
 });
 
 function createBackgroundHarness(storageData = {}) {
@@ -312,4 +336,91 @@ test('background returns configured mock data to the page interceptor', async ()
   assert.equal(result.mocked, true);
   assert.equal(result.mockResponse.status, 202);
   assert.equal(result.mockResponse.body, '{"ok":true}');
+});
+
+test('background applies sensitive-data redaction and excludes configured hosts', async () => {
+  const { dispatch } = createBackgroundHarness();
+  const popupSender = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' };
+  const sender = { id: 'extension-id', tab: { id: 3 }, frameId: 0, url: 'https://example.test/' };
+
+  await dispatch({ type: 'UPDATE_SETTINGS', data: { excludedHosts: ['blocked.test'] } }, popupSender);
+  const excluded = await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'excluded', url: 'https://api.blocked.test/data', startTime: 1, type: 'fetch',
+  } }, sender);
+  assert.equal(excluded, null);
+
+  await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'redacted', url: 'https://api.example.test/data', startTime: 1, type: 'fetch',
+    requestHeaders: { Authorization: 'secret' }, requestBody: '{"token":"secret"}',
+  } }, sender);
+  const result = await dispatch({ type: 'GET_REQUESTS', data: { tabId: 3 } }, popupSender);
+  assert.equal(result.requests[0].requestHeaders.Authorization, '[REDACTED]');
+  assert.equal(result.requests[0].requestBody, '{"token":"[REDACTED]"}');
+});
+
+test('background isolates requests by tab and supports method-specific mocks', async () => {
+  const { dispatch } = createBackgroundHarness();
+  const popupSender = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' };
+  const sender1 = { id: 'extension-id', tab: { id: 1 }, frameId: 0 };
+  const sender2 = { id: 'extension-id', tab: { id: 2 }, frameId: 0 };
+
+  await dispatch({ type: 'ADD_MOCK_RULE', data: {
+    pattern: '/only-post', method: 'POST', status: 201, body: 'created', delay: 12,
+  } }, popupSender);
+  const getResult = await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'get', url: 'https://example.test/only-post', method: 'GET', startTime: 1, type: 'fetch',
+  } }, sender1);
+  const postResult = await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'post', url: 'https://example.test/only-post', method: 'POST', startTime: 1, type: 'fetch',
+  } }, sender1);
+  await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'other-tab', url: 'https://example.test/other', method: 'GET', startTime: 1, type: 'fetch',
+  } }, sender2);
+
+  assert.equal(getResult.mocked, false);
+  assert.equal(postResult.mocked, true);
+  assert.equal(postResult.mockResponse.delay, 12);
+  const scoped = await dispatch({ type: 'GET_REQUESTS', data: { tabId: 1 } }, popupSender);
+  assert.equal(scoped.requests.length, 2);
+  await dispatch({ type: 'CLEAR_REQUESTS', data: { tabId: 1 } }, popupSender);
+  const remaining = await dispatch({ type: 'GET_REQUESTS' }, popupSender);
+  assert.equal(remaining.requests.length, 1);
+  assert.equal(remaining.requests[0].captureId, 'other-tab');
+});
+
+test('background tracks WebSocket readiness and request tags', async () => {
+  const { dispatch } = createBackgroundHarness();
+  const popupSender = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' };
+  const sender = { id: 'extension-id', tab: { id: 4 }, frameId: 0 };
+  await dispatch({ type: 'WS_OPEN', data: { id: 'ws-1', url: 'wss://example.test', startTime: 10 } }, sender);
+  let result = await dispatch({ type: 'GET_WS_DETAIL', data: { id: 'ws-1' } }, popupSender);
+  assert.equal(result.connection.status, 'connecting');
+  await dispatch({ type: 'WS_READY', data: { id: 'ws-1', timestamp: 20 } }, sender);
+  result = await dispatch({ type: 'GET_WS_DETAIL', data: { id: 'ws-1' } }, popupSender);
+  assert.equal(result.connection.status, 'open');
+
+  await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'tagged', url: 'https://example.test/tagged', startTime: 1, type: 'fetch',
+  } }, sender);
+  const updated = await dispatch({ type: 'UPDATE_TAGS', data: { id: 1, tags: ['important', 'api'] } }, popupSender);
+  assert.equal(updated.ok, true);
+  result = await dispatch({ type: 'GET_REQUESTS', data: { tabId: 4 } }, popupSender);
+  assert.deepEqual(result.requests[0].tags, ['important', 'api']);
+});
+
+test('HAR export includes query parameters and request MIME type', async () => {
+  const { dispatch } = createBackgroundHarness();
+  const popupSender = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' };
+  const sender = { id: 'extension-id', tab: { id: 5 }, frameId: 0 };
+  await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'har-1', url: 'https://example.test/api?a=1&b=two', method: 'POST', startTime: 100,
+    type: 'fetch', requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, requestBody: 'a=1',
+  } }, sender);
+  await dispatch({ type: 'NET_RESPONSE', data: {
+    captureId: 'har-1', status: 200, statusText: 'OK', endTime: 120, responseHeaders: {}, responseBody: 'ok',
+  } }, sender);
+  const result = await dispatch({ type: 'EXPORT_HAR', data: { tabId: 5 } }, popupSender);
+  const entry = result.har.log.entries[0];
+  assert.equal(JSON.stringify(entry.request.queryString), JSON.stringify([{ name: 'a', value: '1' }, { name: 'b', value: 'two' }]));
+  assert.equal(entry.request.postData.mimeType, 'application/x-www-form-urlencoded');
 });

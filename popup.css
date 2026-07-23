@@ -130,6 +130,7 @@ body {
   font-size: 10px;
   outline: none;
 }
+.excluded-hosts { flex: 0 1 180px; }
 
 /* 列表 */
 .request-list, .ws-list, .timeline-view, .mock-view {
@@ -258,6 +259,7 @@ body {
   text-align: center;
 }
 .ws-open { background: #00b894; color: #fff; }
+.ws-connecting { background: #fdcb6e; color: #333; }
 .ws-closed { background: #636e72; color: #fff; }
 .ws-error { background: #e74c3c; color: #fff; }
 .ws-url { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
@@ -288,6 +290,9 @@ body {
 .ws-detail-panel { height: 540px; }
 .mock-edit-panel { height: auto; max-height: 500px; }
 .save-filter-panel { height: auto; max-height: 200px; }
+.detail-tags { display: flex; align-items: center; gap: 8px; padding: 5px 12px; background: #16213e; border-bottom: 1px solid #0f3460; }
+.detail-tags label { color: #888; }
+.detail-tags .form-input { flex: 1; }
 .detail-header {
   display: flex;
   align-items: center;
@@ -388,6 +393,7 @@ body {
 
 /* 重放结果 */
 .replay-result { padding: 4px 0; }
+.replay-editor { border-bottom: 1px solid #0f3460; margin-bottom: 8px; }
 .replay-status { font-weight: bold; font-size: 14px; margin-bottom: 8px; }
 .replay-error { color: #e74c3c; padding: 10px; }
 

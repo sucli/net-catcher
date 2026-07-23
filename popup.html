@@ -22,6 +22,11 @@
       <select id="saved-filters" class="filter-select" title="已保存的过滤器">
         <option value="">过滤器...</option>
       </select>
+      <button id="btn-delete-filter" class="btn btn-small" title="删除选中的过滤器">✕</button>
+      <select id="capture-scope" class="filter-select" title="请求范围">
+        <option value="current">当前标签页</option>
+        <option value="all">全部标签页</option>
+      </select>
       <button id="btn-save-filter" class="btn btn-small" title="保存当前过滤条件">💾</button>
       <button id="btn-toggle" class="btn btn-green" title="暂停/恢复">⏸</button>
       <button id="btn-clear" class="btn btn-red" title="清除记录">🗑</button>
@@ -29,6 +34,10 @@
       <label class="auto-scroll-toggle" title="自动滚动到最新请求">
         <input type="checkbox" id="chk-auto-scroll" checked>
         <span>滚动</span>
+      </label>
+      <label class="auto-scroll-toggle" title="隐藏常见敏感字段">
+        <input type="checkbox" id="chk-redact" checked>
+        <span>脱敏</span>
       </label>
     </div>
   </div>
@@ -53,6 +62,9 @@
       <option value="POST">POST</option>
       <option value="PUT">PUT</option>
       <option value="DELETE">DELETE</option>
+      <option value="PATCH">PATCH</option>
+      <option value="OPTIONS">OPTIONS</option>
+      <option value="HEAD">HEAD</option>
     </select>
     <select id="filter-status" class="filter-select">
       <option value="">全部状态</option>
@@ -73,8 +85,11 @@
       <option value="duration-desc">耗时 ↓</option>
       <option value="duration-asc">耗时 ↑</option>
       <option value="size-desc">大小 ↓</option>
+      <option value="size-asc">大小 ↑</option>
     </select>
     <button id="btn-group-toggle" class="btn btn-small" title="分组显示">📁</button>
+    <label class="auto-scroll-toggle"><input type="checkbox" id="filter-starred"><span>收藏</span></label>
+    <input type="text" id="excluded-hosts" placeholder="排除域名，用逗号分隔" class="filter-input excluded-hosts">
   </div>
 
   <!-- HTTP 请求列表 -->
@@ -87,6 +102,10 @@
   </div>
 
   <!-- WebSocket 连接列表 -->
+  <div class="filter-bar" id="ws-filter-bar" style="display:none">
+    <input id="ws-filter" class="filter-input" placeholder="搜索 URL 或消息">
+    <select id="ws-direction" class="filter-select"><option value="">全部方向</option><option value="send">发送</option><option value="receive">接收</option></select>
+  </div>
   <div class="ws-list" id="ws-list" style="display:none">
     <div class="empty-state" id="ws-empty-state">
       <div class="empty-icon">🔌</div>
@@ -120,6 +139,7 @@
           <button id="btn-close-detail" class="btn-close">✕</button>
         </div>
       </div>
+      <div class="detail-tags"><label for="detail-tags">标签</label><input id="detail-tags" class="form-input" placeholder="逗号分隔"></div>
       <div class="detail-tabs">
         <button class="tab active" data-tab="tab-headers">Headers</button>
         <button class="tab" data-tab="tab-request">请求体</button>
@@ -132,7 +152,14 @@
         <div id="tab-request" class="tab-content"></div>
         <div id="tab-response" class="tab-content"></div>
         <div id="tab-preview" class="tab-content"></div>
-        <div id="tab-replay-result" class="tab-content"></div>
+        <div id="tab-replay-result" class="tab-content">
+          <div class="replay-editor">
+            <div class="form-row"><label>重放方法</label><select id="replay-method" class="form-input form-input-small"></select></div>
+            <div class="form-row"><label>请求头 (JSON)</label><textarea id="replay-headers" class="form-textarea"></textarea></div>
+            <div class="form-row"><label>请求体</label><textarea id="replay-body" class="form-textarea"></textarea></div>
+          </div>
+          <div id="replay-output" class="no-data">点击「重放」按钮测试请求</div>
+        </div>
       </div>
     </div>
   </div>
@@ -194,6 +221,18 @@
         <div class="form-row">
           <label>状态码</label>
           <input type="number" id="mock-status" value="200" class="form-input form-input-small">
+        </div>
+        <div class="form-row">
+          <label>HTTP 方法</label>
+          <select id="mock-method" class="form-input form-input-small">
+            <option value="*">全部</option>
+            <option>GET</option><option>POST</option><option>PUT</option>
+            <option>PATCH</option><option>DELETE</option><option>OPTIONS</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>响应延迟 (ms)</label>
+          <input type="number" id="mock-delay" min="0" value="0" class="form-input form-input-small">
         </div>
         <div class="form-row">
           <label>响应头 (JSON)</label>

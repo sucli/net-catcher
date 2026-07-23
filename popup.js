@@ -11,6 +11,9 @@ let autoScroll = true;
 let currentView = 'http';
 let groupByDomain = false;
 let compareMode = false;
+let activeTabId = null;
+let captureScope = 'current';
+let captureSettings = { redactSensitive: true, excludedHosts: [] };
 
 // 初始化
 document.addEventListener('DOMContentLoaded', () => {
@@ -20,14 +23,19 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('chk-auto-scroll').checked = autoScroll;
     document.getElementById('btn-group-toggle').classList.toggle('active', groupByDomain);
   });
-  loadRequests();
-  loadFilters();
+    chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+      activeTabId = tabs?.[0]?.id ?? null;
+      loadRequests();
+    });
+    loadFilters();
+    loadSettings();
   bindEvents();
 });
 
 // 加载请求数据
 function loadRequests() {
-  chrome.runtime.sendMessage({ type: 'GET_REQUESTS' }, (res) => {
+  const data = captureScope === 'current' && Number.isInteger(activeTabId) ? { tabId: activeTabId } : {};
+  chrome.runtime.sendMessage({ type: 'GET_REQUESTS', data }, (res) => {
     if (chrome.runtime.lastError) return;
     if (res) {
       allRequests = res.requests || [];
@@ -42,6 +50,24 @@ function loadRequests() {
       else if (currentView === 'mock') renderMockRules();
     }
   });
+}
+
+function loadSettings() {
+  chrome.runtime.sendMessage({ type: 'GET_SETTINGS' }, res => {
+    if (!res?.settings) return;
+    captureSettings = res.settings;
+    document.getElementById('chk-redact').checked = captureSettings.redactSensitive !== false;
+    document.getElementById('excluded-hosts').value = (captureSettings.excludedHosts || []).join(', ');
+  });
+}
+
+function saveSettings() {
+  captureSettings = {
+    ...captureSettings,
+    redactSensitive: document.getElementById('chk-redact').checked,
+    excludedHosts: document.getElementById('excluded-hosts').value.split(',').map(value => value.trim()).filter(Boolean),
+  };
+  chrome.runtime.sendMessage({ type: 'UPDATE_SETTINGS', data: captureSettings });
 }
 
 // 加载过滤器
@@ -79,11 +105,19 @@ function bindEvents() {
     document.getElementById('filter-bar').style.display = (currentView === 'http' || currentView === 'timeline') ? '' : 'none';
     document.getElementById('request-list').style.display = currentView === 'http' ? '' : 'none';
     document.getElementById('ws-list').style.display = currentView === 'ws' ? '' : 'none';
+    document.getElementById('ws-filter-bar').style.display = currentView === 'ws' ? '' : 'none';
     document.getElementById('timeline-view').style.display = currentView === 'timeline' ? '' : 'none';
     document.getElementById('mock-view').style.display = currentView === 'mock' ? '' : 'none';
   }
 
   // 暂停/恢复
+  document.getElementById('capture-scope').addEventListener('change', e => {
+    captureScope = e.target.value;
+    loadRequests();
+  });
+  document.getElementById('chk-redact').addEventListener('change', saveSettings);
+  document.getElementById('excluded-hosts').addEventListener('change', saveSettings);
+
   document.getElementById('btn-toggle').addEventListener('click', () => {
     chrome.runtime.sendMessage({ type: 'TOGGLE_CAPTURE' }, (res) => {
       if (res) { isCapturing = res.isCapturing; updateToggleButton(); }
@@ -92,7 +126,8 @@ function bindEvents() {
 
   // 清除
   document.getElementById('btn-clear').addEventListener('click', () => {
-    chrome.runtime.sendMessage({ type: 'CLEAR_REQUESTS' }, () => {
+    const data = captureScope === 'current' && Number.isInteger(activeTabId) ? { tabId: activeTabId } : {};
+    chrome.runtime.sendMessage({ type: 'CLEAR_REQUESTS', data }, () => {
       allRequests = []; allWsConnections = []; selectedIds.clear();
       if (currentView === 'http') { renderRequests(); updateStats(); }
       else if (currentView === 'ws') renderWsConnections();
@@ -103,7 +138,8 @@ function bindEvents() {
 
   // 导出
   document.getElementById('btn-export').addEventListener('click', () => {
-    chrome.runtime.sendMessage({ type: 'EXPORT_HAR' }, (res) => {
+    const data = captureScope === 'current' && Number.isInteger(activeTabId) ? { tabId: activeTabId } : {};
+    chrome.runtime.sendMessage({ type: 'EXPORT_HAR', data }, (res) => {
       if (res && res.har) {
         downloadFile(JSON.stringify(res.har, null, 2), 'application/json',
           `netcatcher-${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.har`);
@@ -165,6 +201,14 @@ function bindEvents() {
       }
     });
   });
+  document.getElementById('btn-delete-filter').addEventListener('click', () => {
+    const id = parseInt(document.getElementById('saved-filters').value, 10);
+    if (!id) return;
+    chrome.runtime.sendMessage({ type: 'DELETE_FILTER', data: { id } }, () => {
+      loadFilters();
+      showToast('过滤器已删除');
+    });
+  });
 
   // 关闭面板
   document.getElementById('btn-close-detail').addEventListener('click', closeDetail);
@@ -207,6 +251,13 @@ function bindEvents() {
 
   // 导出 WS
   document.getElementById('btn-ws-export').addEventListener('click', exportWsMessages);
+  document.getElementById('ws-filter').addEventListener('input', () => {
+    renderWsConnections();
+    if (selectedWsId) showWsDetail(selectedWsId);
+  });
+  document.getElementById('ws-direction').addEventListener('change', () => {
+    if (selectedWsId) showWsDetail(selectedWsId);
+  });
 
   // Mock 规则管理
   document.getElementById('btn-add-mock').addEventListener('click', () => openMockEditor());
@@ -238,9 +289,18 @@ function bindEvents() {
     autoScroll = e.target.checked;
     chrome.storage.local.set({ nc_autoScroll: autoScroll });
   });
+  document.getElementById('filter-starred').addEventListener('change', renderRequests);
 
   // 键盘快捷键
   document.addEventListener('keydown', (e) => {
+    if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) {
+      const visible = filterAndSortRequests(allRequests);
+      const current = Array.from(selectedIds)[0];
+      let index = visible.findIndex(request => request.id === current);
+      index = e.key === 'ArrowDown' ? Math.min(visible.length - 1, index + 1) : Math.max(0, index - 1);
+      if (visible[index]) { e.preventDefault(); showDetail(visible[index].id); }
+      return;
+    }
     if (e.key === 'Escape') {
       if (document.getElementById('detail-overlay').style.display !== 'none') { closeDetail(); return; }
       if (document.getElementById('ws-detail-overlay').style.display !== 'none') { closeWsDetail(); return; }
@@ -266,7 +326,18 @@ function replayRequest() {
   btn.textContent = '⏳ 重放中...';
   btn.disabled = true;
 
-  chrome.runtime.sendMessage({ type: 'REPLAY_REQUEST', data: { id } }, (res) => {
+  let replayHeaders = {};
+  try { replayHeaders = JSON.parse(document.getElementById('replay-headers').value || '{}'); } catch {
+    document.getElementById('replay-output').innerHTML = '<div class="replay-error">请求头 JSON 格式无效</div>';
+    btn.textContent = '🔄 重放';
+    btn.disabled = false;
+    return;
+  }
+  chrome.runtime.sendMessage({ type: 'REPLAY_REQUEST', data: { id, options: {
+    method: document.getElementById('replay-method').value,
+    headers: replayHeaders,
+    body: document.getElementById('replay-body').value,
+  } } }, (res) => {
     btn.textContent = '🔄 重放';
     btn.disabled = false;
 
@@ -277,10 +348,10 @@ function replayRequest() {
     document.getElementById('tab-replay-result').classList.add('active');
 
     if (chrome.runtime.lastError || !res) {
-      document.getElementById('tab-replay-result').innerHTML =
+      document.getElementById('replay-output').innerHTML =
         `<div class="replay-error">❌ 错误: ${escapeHtml(chrome.runtime.lastError?.message || '扩展后台无响应')}</div>`;
     } else if (res.error) {
-      document.getElementById('tab-replay-result').innerHTML =
+      document.getElementById('replay-output').innerHTML =
         `<div class="replay-error">❌ 错误: ${escapeHtml(res.error)}</div>`;
     } else {
       let html = '<div class="replay-result">';
@@ -294,7 +365,7 @@ function replayRequest() {
       html += '<div class="header-section-title">响应体</div>';
       html += `<div class="body-content">${formatBody(res.body)}</div>`;
       html += '</div>';
-      document.getElementById('tab-replay-result').innerHTML = html;
+      document.getElementById('replay-output').innerHTML = html;
     }
   });
 }
@@ -561,7 +632,7 @@ function renderMockRules() {
         </div>
       </div>
       <div class="mock-item-detail">
-        <span class="mock-pattern">${rule.isRegex ? '🔤' : '📝'} ${escapeHtml(rule.pattern)}</span>
+        <span class="mock-pattern">${rule.isRegex ? '🔤' : '📝'} ${escapeHtml(rule.method || '*')} ${escapeHtml(rule.pattern)}</span>
         <span class="mock-status">${rule.status}</span>
       </div>
     </div>
@@ -595,6 +666,8 @@ function openMockEditor(rule) {
   document.getElementById('mock-name').value = rule?.name || '';
   document.getElementById('mock-pattern').value = rule?.pattern || '';
   document.getElementById('mock-is-regex').checked = rule?.isRegex || false;
+  document.getElementById('mock-method').value = rule?.method || '*';
+  document.getElementById('mock-delay').value = rule?.delay || 0;
   document.getElementById('mock-status').value = rule?.status || 200;
   document.getElementById('mock-headers').value = JSON.stringify(rule?.headers || { 'content-type': 'application/json' });
   document.getElementById('mock-body').value = rule?.body || '{"code":0,"data":{}}';
@@ -613,6 +686,8 @@ function saveMockRule() {
     name: document.getElementById('mock-name').value.trim(),
     pattern,
     isRegex: document.getElementById('mock-is-regex').checked,
+    method: document.getElementById('mock-method').value,
+    delay: Math.max(0, parseInt(document.getElementById('mock-delay').value, 10) || 0),
     status: parseInt(document.getElementById('mock-status').value) || 200,
     headers,
     body: document.getElementById('mock-body').value,
@@ -681,8 +756,19 @@ function showDetail(id) {
 
   // 响应预览
   renderPreview(r);
+  document.getElementById('detail-tags').value = (r.tags || []).join(', ');
+  document.getElementById('detail-tags').onchange = event => {
+    const tags = event.target.value.split(',').map(tag => tag.trim()).filter(Boolean);
+    chrome.runtime.sendMessage({ type: 'UPDATE_TAGS', data: { id: r.id, tags } });
+  };
+  document.getElementById('btn-star').textContent = r.starred ? '⭐ 已收藏' : '⭐';
 
-  document.getElementById('tab-replay-result').innerHTML = '<div class="no-data">点击「重放」按钮测试请求</div>';
+  const replayMethod = document.getElementById('replay-method');
+  replayMethod.innerHTML = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD']
+    .map(method => `<option ${method === r.method ? 'selected' : ''}>${method}</option>`).join('');
+  document.getElementById('replay-headers').value = JSON.stringify(r.requestHeaders || {}, null, 2);
+  document.getElementById('replay-body').value = r.requestBody || '';
+  document.getElementById('replay-output').innerHTML = '<div class="no-data">点击「重放」按钮测试请求</div>';
 
   // 重置 tab
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -735,19 +821,22 @@ function renderWsConnections() {
   const list = document.getElementById('ws-list');
   const empty = document.getElementById('ws-empty-state');
   document.getElementById('ws-count').textContent = allWsConnections.length;
+  const query = document.getElementById('ws-filter').value.toLowerCase();
+  const connections = allWsConnections.filter(conn => !query || conn.url.toLowerCase().includes(query) ||
+    (conn.messages || []).some(message => String(message.data).toLowerCase().includes(query)));
 
-  if (allWsConnections.length === 0) {
+  if (connections.length === 0) {
     list.querySelectorAll('.ws-item').forEach(el => el.remove());
     empty.style.display = 'flex';
     return;
   }
 
   empty.style.display = 'none';
-  list.innerHTML = allWsConnections.map(conn => {
-    const statusClass = conn.status === 'open' ? 'ws-open' : (conn.status === 'error' ? 'ws-error' : 'ws-closed');
-    const msgCount = conn.messageCount ? (conn.messageCount.send + conn.messageCount.receive) : conn.messages.length;
+  list.innerHTML = connections.map(conn => {
+    const statusClass = conn.status === 'open' ? 'ws-open' : (conn.status === 'error' ? 'ws-error' : (conn.status === 'connecting' ? 'ws-connecting' : 'ws-closed'));
+    const msgCount = conn.messageCount ? (conn.messageCount.send + conn.messageCount.receive) : (conn.messages || []).length;
     return `<div class="ws-item" data-id="${escapeHtml(conn.id)}">
-      <span class="ws-status ${statusClass}">${conn.status === 'open' ? '已连接' : (conn.status === 'error' ? '错误' : '已关闭')}</span>
+      <span class="ws-status ${statusClass}">${conn.status === 'open' ? '已连接' : (conn.status === 'connecting' ? '连接中' : (conn.status === 'error' ? '错误' : '已关闭'))}</span>
       <span class="ws-url" title="${escapeHtml(conn.url)}">${escapeHtml(getShortUrl(conn.url))}</span>
       <span class="ws-messages">📨 ${msgCount}</span>
       <span class="ws-duration">${conn.duration ? formatDuration(conn.duration) : (conn.status === 'open' ? '运行中' : '...')}</span>
@@ -774,11 +863,16 @@ function showWsDetail(id) {
   if (conn.protocols) infoHtml += `<tr><td>协议</td><td>${escapeHtml(conn.protocols)}</td></tr>`;
   if (conn.closeCode) infoHtml += `<tr><td>关闭代码</td><td>${conn.closeCode}</td></tr>`;
   if (conn.closeReason) infoHtml += `<tr><td>关闭原因</td><td>${escapeHtml(conn.closeReason)}</td></tr>`;
-  infoHtml += `<tr><td>消息数</td><td>发送: ${conn.messageCount.send}, 接收: ${conn.messageCount.receive}</td></tr>`;
+  const messageCount = conn.messageCount || { send: 0, receive: 0 };
+  infoHtml += `<tr><td>消息数</td><td>发送: ${messageCount.send}, 接收: ${messageCount.receive}</td></tr>`;
   infoHtml += '</table>';
   document.getElementById('ws-info').innerHTML = infoHtml;
 
-  const messages = conn.messages || [];
+  const query = document.getElementById('ws-filter').value.toLowerCase();
+  const direction = document.getElementById('ws-direction').value;
+  const messages = (conn.messages || []).filter(message =>
+    (!direction || message.direction === direction) && (!query || String(message.data).toLowerCase().includes(query))
+  );
   document.getElementById('ws-messages').innerHTML = messages.length === 0 ?
     '<div class="ws-no-messages">暂无消息</div>' :
     messages.map(msg => {
@@ -862,11 +956,13 @@ function filterAndSortRequests(requests) {
   const statusFilter = document.getElementById('filter-status').value;
   const typeFilter = document.getElementById('filter-type').value;
   const sort = document.getElementById('filter-sort').value;
+  const starredOnly = document.getElementById('filter-starred').checked;
 
   return requests.filter(r => {
     if (urlFilter && !r.url.toLowerCase().includes(urlFilter)) return false;
     if (methodFilter && r.method !== methodFilter) return false;
     if (typeFilter && r.type !== typeFilter) return false;
+    if (starredOnly && !r.starred) return false;
     if (statusFilter) {
       if (statusFilter === '0' && (r.status !== 0 && r.status !== null)) return false;
       if (statusFilter === '2xx' && !(r.status >= 200 && r.status < 300)) return false;

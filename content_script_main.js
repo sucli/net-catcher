@@ -5,9 +5,10 @@
   'use strict';
 
   const MAX_CAPTURE_BODY_BYTES = 1024 * 1024;
-  const BRIDGE_TIMEOUT_MS = 1000;
+  const BRIDGE_TIMEOUT_MS = 250;
   const pendingBridgeRequests = new Map();
   let fallbackId = 0;
+  let mockDecisionRequired = true;
 
   function now() {
     return performance.timeOrigin + performance.now();
@@ -40,7 +41,12 @@
   }
 
   window.addEventListener('message', event => {
-    if (event.source !== window || !event.data?.__netCatcherResponse) return;
+    if (event.source !== window) return;
+    if (event.data?.__netCatcherConfig) {
+      mockDecisionRequired = !!event.data.hasActiveMockRules;
+      return;
+    }
+    if (!event.data?.__netCatcherResponse) return;
     const resolve = pendingBridgeRequests.get(event.data.messageId);
     if (!resolve) return;
     pendingBridgeRequests.delete(event.data.messageId);
@@ -110,8 +116,10 @@
   window.fetch = async function(...args) {
     const input = args[0];
     const init = args[1] || {};
-    const url = typeof input === 'string' ? input :
+    const rawUrl = typeof input === 'string' ? input :
       input instanceof Request ? input.url : String(input);
+    let url = rawUrl;
+    try { url = new URL(rawUrl, window.location?.href).href; } catch {}
     const method = (init.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
     const requestHeaders = normalizeHeaders(init.headers || (input instanceof Request ? input.headers : null));
     const captureId = createCaptureId('http');
@@ -125,10 +133,14 @@
       else try { requestBody = JSON.stringify(init.body); } catch {}
     }
 
-    const registration = await requestBridge('NET_REQUEST', {
+    const requestData = {
       captureId, url, method, requestHeaders, requestBody, startTime, type: 'fetch',
-    });
+    };
+    const registration = mockDecisionRequired ?
+      await requestBridge('NET_REQUEST', requestData) : (sendToBridge('NET_REQUEST', requestData), null);
     if (registration?.mocked && registration.mockResponse) {
+      const delay = Math.max(0, Number(registration.mockResponse.delay) || 0);
+      if (delay) await new Promise(resolve => setTimeout(resolve, delay));
       return createMockResponse(url, registration.mockResponse);
     }
 
@@ -167,7 +179,7 @@
   XHR.open = function(method, url, ...rest) {
     this._netCatcher = {
       method: String(method).toUpperCase(),
-      url: String(url),
+      url: (() => { try { return new URL(String(url), window.location?.href).href; } catch { return String(url); } })(),
       requestHeaders: {},
       async: rest.length === 0 || rest[0] !== false,
       aborted: false,
@@ -287,10 +299,17 @@
       return originalSend.apply(this, [body]);
     }
 
+    if (!mockDecisionRequired) {
+      sendToBridge('NET_REQUEST', requestData);
+      return originalSend.apply(this, [body]);
+    }
+
     requestBridge('NET_REQUEST', requestData).then(registration => {
       if (nc.aborted) return;
       if (registration?.mocked && registration.mockResponse) {
-        completeMockXhr(xhr, nc, registration.mockResponse);
+        const delay = Math.max(0, Number(registration.mockResponse.delay) || 0);
+        if (delay) setTimeout(() => completeMockXhr(xhr, nc, registration.mockResponse), delay);
+        else completeMockXhr(xhr, nc, registration.mockResponse);
       } else {
         originalSend.apply(xhr, [body]);
       }
@@ -307,6 +326,9 @@
     const ws = protocols !== undefined ? new OriginalWebSocket(url, protocols) : new OriginalWebSocket(url);
 
     sendToBridge('WS_OPEN', { id: wsId, url: wsUrl, startTime, protocols: protocols || null });
+    ws.addEventListener('open', () => {
+      sendToBridge('WS_READY', { id: wsId, timestamp: now() });
+    });
 
     const originalWsSend = ws.send.bind(ws);
     ws.send = function(data) {
