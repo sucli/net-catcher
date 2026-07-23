@@ -276,12 +276,15 @@ function replayRequest() {
     document.querySelector('.tab[data-tab="tab-replay-result"]').classList.add('active');
     document.getElementById('tab-replay-result').classList.add('active');
 
-    if (res.error) {
+    if (chrome.runtime.lastError || !res) {
+      document.getElementById('tab-replay-result').innerHTML =
+        `<div class="replay-error">❌ 错误: ${escapeHtml(chrome.runtime.lastError?.message || '扩展后台无响应')}</div>`;
+    } else if (res.error) {
       document.getElementById('tab-replay-result').innerHTML =
         `<div class="replay-error">❌ 错误: ${escapeHtml(res.error)}</div>`;
     } else {
       let html = '<div class="replay-result">';
-      html += `<div class="replay-status ${res.status < 400 ? 'status-2xx' : 'status-5xx'}">${res.status} ${res.statusText}</div>`;
+      html += `<div class="replay-status ${res.status < 400 ? 'status-2xx' : 'status-5xx'}">${res.status} ${escapeHtml(res.statusText)}</div>`;
       html += '<div class="header-section-title">响应头</div>';
       html += '<table class="header-table">';
       Object.entries(res.headers || {}).forEach(([k, v]) => {
@@ -330,7 +333,7 @@ function renderFlatRequests(list, requests) {
     const starred = r.starred ? ' ⭐' : '';
     const mocked = r.isMocked ? ' 🎭' : '';
     return `<div class="request-item${selected}" data-id="${r.id}">
-      <span class="req-method method-${r.method}">${r.method}</span>
+      <span class="req-method ${getMethodClass(r.method)}">${escapeHtml(r.method)}</span>
       <span class="req-url" title="${escapeHtml(r.url)}">${escapeHtml(getShortUrl(r.url))}${starred}${mocked}</span>
       <span class="req-status ${r.status ? getStatusClass(r.status) : 'status-0'}">${r.status || '---'}</span>
       <span class="req-duration">${r.duration ? Math.round(r.duration) + 'ms' : '...'}</span>
@@ -367,7 +370,7 @@ function renderGroupedRequests(list, requests) {
     items.forEach(r => {
       const selected = selectedIds.has(r.id) ? ' selected' : '';
       html += `<div class="request-item${selected}" data-id="${r.id}">
-        <span class="req-method method-${r.method}">${r.method}</span>
+        <span class="req-method ${getMethodClass(r.method)}">${escapeHtml(r.method)}</span>
         <span class="req-url" title="${escapeHtml(r.url)}">${escapeHtml(getShortUrl(r.url))}</span>
         <span class="req-status ${r.status ? getStatusClass(r.status) : 'status-0'}">${r.status || '---'}</span>
         <span class="req-duration">${r.duration ? Math.round(r.duration) + 'ms' : '...'}</span>
@@ -461,7 +464,7 @@ function showCompare() {
 function buildCompareCard(r) {
   return `<table class="header-table">
     <tr><td>URL</td><td class="compare-url">${escapeHtml(getShortUrl(r.url))}</td></tr>
-    <tr><td>方法</td><td>${r.method}</td></tr>
+    <tr><td>方法</td><td>${escapeHtml(r.method)}</td></tr>
     <tr><td>状态</td><td class="${getStatusClass(r.status)}">${r.status || '---'}</td></tr>
     <tr><td>耗时</td><td>${r.duration ? Math.round(r.duration) + 'ms' : '---'}</td></tr>
     <tr><td>大小</td><td>${r.size ? formatSize(r.size) : '---'}</td></tr>
@@ -514,7 +517,8 @@ function renderTimeline() {
     const statusClass = r.status ? getStatusClass(r.status) : 'status-0';
     const shortUrl = getShortUrl(r.url);
 
-    html += `<div class="timeline-row" data-id="${r.id}" title="${r.method} ${r.url}\n${r.status || '---'} | ${r.duration ? Math.round(r.duration) + 'ms' : '...'}">
+    const title = `${r.method} ${r.url}\n${r.status || '---'} | ${r.duration ? Math.round(r.duration) + 'ms' : '...'}`;
+    html += `<div class="timeline-row" data-id="${r.id}" title="${escapeHtml(title)}">
       <div class="timeline-label">${escapeHtml(shortUrl.slice(0, 30))}</div>
       <div class="timeline-bar-container">
         <div class="timeline-bar ${statusClass}" style="left:${startPct}%;width:${widthPct}%"></div>
@@ -644,9 +648,9 @@ function showDetail(id) {
   let headersHtml = '<div class="header-section-title">常规信息</div>';
   headersHtml += `<table class="header-table">
     <tr><td>请求 URL</td><td class="detail-url">${escapeHtml(r.url)}</td></tr>
-    <tr><td>请求方法</td><td>${r.method}</td></tr>
-    <tr><td>类型</td><td>${r.type}</td></tr>
-    <tr><td>状态码</td><td class="${getStatusClass(r.status)}">${r.status || '---'} ${r.statusText || ''}</td></tr>
+    <tr><td>请求方法</td><td>${escapeHtml(r.method)}</td></tr>
+    <tr><td>类型</td><td>${escapeHtml(r.type)}</td></tr>
+    <tr><td>状态码</td><td class="${getStatusClass(r.status)}">${r.status || '---'} ${escapeHtml(r.statusText || '')}</td></tr>
     <tr><td>耗时</td><td>${r.duration ? Math.round(r.duration) + 'ms' : '---'}</td></tr>
     <tr><td>大小</td><td>${r.size ? formatSize(r.size) : '---'}</td></tr>
   </table>`;
@@ -712,7 +716,12 @@ function renderPreview(r) {
 
   // 图片预览
   if (contentType.includes('image')) {
-    preview.innerHTML = `<div class="preview-image"><img src="${r.url}" alt="预览" onerror="this.style.display='none';this.nextElementSibling.style.display='block'"><div class="no-data" style="display:none">图片加载失败</div></div>`;
+    preview.innerHTML = `<div class="preview-image"><img src="${escapeHtml(r.url)}" alt="预览"><div class="no-data" style="display:none">图片加载失败</div></div>`;
+    const image = preview.querySelector('img');
+    image.addEventListener('error', () => {
+      image.style.display = 'none';
+      image.nextElementSibling.style.display = 'block';
+    });
     return;
   }
 
@@ -737,7 +746,7 @@ function renderWsConnections() {
   list.innerHTML = allWsConnections.map(conn => {
     const statusClass = conn.status === 'open' ? 'ws-open' : (conn.status === 'error' ? 'ws-error' : 'ws-closed');
     const msgCount = conn.messageCount ? (conn.messageCount.send + conn.messageCount.receive) : conn.messages.length;
-    return `<div class="ws-item" data-id="${conn.id}">
+    return `<div class="ws-item" data-id="${escapeHtml(conn.id)}">
       <span class="ws-status ${statusClass}">${conn.status === 'open' ? '已连接' : (conn.status === 'error' ? '错误' : '已关闭')}</span>
       <span class="ws-url" title="${escapeHtml(conn.url)}">${escapeHtml(getShortUrl(conn.url))}</span>
       <span class="ws-messages">📨 ${msgCount}</span>
@@ -747,15 +756,15 @@ function renderWsConnections() {
 
   list.querySelectorAll('.ws-item').forEach(item => {
     item.addEventListener('click', () => {
-      showWsDetail(parseInt(item.dataset.id));
+      showWsDetail(item.dataset.id);
     });
   });
 }
 
 function showWsDetail(id) {
-  const conn = allWsConnections.find(c => c.id === id);
+  const conn = allWsConnections.find(c => String(c.id) === String(id));
   if (!conn) return;
-  selectedWsId = id;
+  selectedWsId = conn.id;
 
   document.getElementById('ws-detail-title').textContent = `WebSocket: ${getShortUrl(conn.url)}`;
 
@@ -779,7 +788,7 @@ function showWsDetail(id) {
       return `<div class="ws-message ${dirClass}">
         <div class="ws-msg-header">
           <span class="ws-msg-dir">${msg.direction === 'send' ? '↑ 发送' : '↓ 接收'}</span>
-          <span class="ws-msg-type">${msg.type}</span>
+          <span class="ws-msg-type">${escapeHtml(msg.type)}</span>
           <span class="ws-msg-time">${formatTimestamp(msg.timestamp)}</span>
         </div>
         <div class="ws-msg-data"><pre>${escapeHtml(data)}</pre></div>
@@ -880,18 +889,22 @@ function filterAndSortRequests(requests) {
 
 function generateCurl(r) {
   if (!r) return '';
-  let parts = [`curl -X ${r.method} '${r.url}'`];
+  let parts = [`curl -X ${r.method} ${shellQuote(r.url)}`];
   if (r.requestHeaders) {
     Object.entries(r.requestHeaders).forEach(([k, v]) => {
       if (!['host', 'connection', 'origin', 'referer'].includes(k.toLowerCase())) {
-        parts.push(`-H '${k}: ${v}'`);
+        parts.push(`-H ${shellQuote(`${k}: ${v}`)}`);
       }
     });
   }
   if (r.requestBody && ['POST', 'PUT', 'PATCH'].includes(r.method)) {
-    parts.push(`-d '${r.requestBody.replace(/'/g, "\\'")}'`);
+    parts.push(`-d ${shellQuote(r.requestBody)}`);
   }
   return parts.join(' \\\n  ');
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
 function formatBody(body) {
@@ -932,6 +945,11 @@ function getStatusClass(s) {
   if (s >= 400 && s < 500) return 'status-4xx';
   if (s >= 500) return 'status-5xx';
   return 'status-0';
+}
+
+function getMethodClass(method) {
+  const safeMethod = /^[A-Z]+$/.test(method || '') ? method : 'OTHER';
+  return `method-${safeMethod}`;
 }
 
 function formatSize(b) {

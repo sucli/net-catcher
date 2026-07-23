@@ -1,16 +1,31 @@
-// NetCatcher - Content Script (ISOLATED world)
-// 接收 MAIN world 发来的 postMessage，通过 chrome.runtime 转发给 background
+// NetCatcher - Content Script Bridge (ISOLATED world)
+// Only capture events may cross from the page into the extension.
 
 (function() {
   'use strict';
 
-  window.addEventListener('message', function(event) {
-    if (event.source !== window) return;
-    if (!event.data || !event.data.__netCatcher) return;
+  const CAPTURE_TYPES = new Set([
+    'NET_REQUEST', 'NET_RESPONSE', 'NET_RESPONSE_BODY', 'NET_ERROR',
+    'WS_OPEN', 'WS_MESSAGE', 'WS_CLOSE', 'WS_ERROR',
+  ]);
 
-    const { type, data } = event.data;
+  window.addEventListener('message', async function(event) {
+    if (event.source !== window || !event.data?.__netCatcher) return;
 
-    // 转发所有消息类型，包括 WebSocket 相关
-    chrome.runtime.sendMessage({ type, data }).catch(() => {});
+    const { messageId, type, data } = event.data;
+    if (!CAPTURE_TYPES.has(type) || !data || typeof data !== 'object') return;
+
+    let response = null;
+    try {
+      response = await chrome.runtime.sendMessage({ type, data });
+    } catch {}
+
+    if (messageId) {
+      window.postMessage({
+        __netCatcherResponse: true,
+        messageId,
+        response,
+      }, '*');
+    }
   });
 })();

@@ -1,34 +1,121 @@
 // NetCatcher - Content Script (MAIN world)
-// 拦截 fetch、XMLHttpRequest 和 WebSocket
+// Intercepts fetch, XMLHttpRequest and WebSocket without changing page handlers.
 
 (function() {
   'use strict';
 
-  let requestCounter = 0;
+  const MAX_CAPTURE_BODY_BYTES = 1024 * 1024;
+  const BRIDGE_TIMEOUT_MS = 1000;
+  const pendingBridgeRequests = new Map();
+  let fallbackId = 0;
+
+  function now() {
+    return performance.timeOrigin + performance.now();
+  }
+
+  function createCaptureId(prefix) {
+    if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+    fallbackId += 1;
+    return `${prefix}-${Date.now()}-${fallbackId}-${Math.random().toString(16).slice(2)}`;
+  }
 
   function sendToBridge(type, data) {
     window.postMessage({ __netCatcher: true, type, data }, '*');
   }
 
-  // ============ 拦截 fetch ============
+  function requestBridge(type, data) {
+    const messageId = createCaptureId('bridge');
+    return new Promise(resolve => {
+      const timer = setTimeout(() => {
+        pendingBridgeRequests.delete(messageId);
+        resolve(null);
+      }, BRIDGE_TIMEOUT_MS);
+
+      pendingBridgeRequests.set(messageId, response => {
+        clearTimeout(timer);
+        resolve(response);
+      });
+      window.postMessage({ __netCatcher: true, messageId, type, data }, '*');
+    });
+  }
+
+  window.addEventListener('message', event => {
+    if (event.source !== window || !event.data?.__netCatcherResponse) return;
+    const resolve = pendingBridgeRequests.get(event.data.messageId);
+    if (!resolve) return;
+    pendingBridgeRequests.delete(event.data.messageId);
+    resolve(event.data.response ?? null);
+  });
+
+  function normalizeHeaders(headers) {
+    const result = {};
+    if (!headers) return result;
+    try {
+      new Headers(headers).forEach((value, name) => { result[name] = value; });
+    } catch {}
+    return result;
+  }
+
+  async function readResponseBody(response) {
+    if (!response.body?.getReader) {
+      const text = await response.text();
+      return {
+        body: text.slice(0, MAX_CAPTURE_BODY_BYTES),
+        size: text.length,
+        truncated: text.length > MAX_CAPTURE_BODY_BYTES,
+      };
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let body = '';
+    let size = 0;
+    let truncated = false;
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        const remaining = MAX_CAPTURE_BODY_BYTES - body.length;
+        if (remaining > 0) body += decoder.decode(value, { stream: true }).slice(0, remaining);
+        if (size > MAX_CAPTURE_BODY_BYTES) {
+          truncated = true;
+          await reader.cancel();
+          break;
+        }
+      }
+      body += decoder.decode();
+    } finally {
+      reader.releaseLock();
+    }
+
+    return { body, size, truncated };
+  }
+
+  function createMockResponse(url, mock) {
+    const status = Number(mock.status) || 200;
+    const body = [204, 205, 304].includes(status) ? null : (mock.body ?? '');
+    const response = new Response(body, {
+      status,
+      statusText: 'Mocked',
+      headers: mock.headers || {},
+    });
+    try { Object.defineProperty(response, 'url', { value: url }); } catch {}
+    return response;
+  }
+
+  // ============ fetch ============
   const originalFetch = window.fetch;
   window.fetch = async function(...args) {
-    const startTime = performance.now();
     const input = args[0];
     const init = args[1] || {};
-
     const url = typeof input === 'string' ? input :
-                input instanceof Request ? input.url : String(input);
+      input instanceof Request ? input.url : String(input);
     const method = (init.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
-
-    const requestHeaders = {};
-    if (init.headers) {
-      if (init.headers instanceof Headers) {
-        init.headers.forEach((v, k) => { requestHeaders[k] = v; });
-      } else if (typeof init.headers === 'object') {
-        Object.assign(requestHeaders, init.headers);
-      }
-    }
+    const requestHeaders = normalizeHeaders(init.headers || (input instanceof Request ? input.headers : null));
+    const captureId = createCaptureId('http');
+    const startTime = now();
 
     let requestBody = null;
     if (init.body) {
@@ -38,38 +125,53 @@
       else try { requestBody = JSON.stringify(init.body); } catch {}
     }
 
-    sendToBridge('NET_REQUEST', { url, method, requestHeaders, requestBody, startTime, type: 'fetch' });
+    const registration = await requestBridge('NET_REQUEST', {
+      captureId, url, method, requestHeaders, requestBody, startTime, type: 'fetch',
+    });
+    if (registration?.mocked && registration.mockResponse) {
+      return createMockResponse(url, registration.mockResponse);
+    }
 
     try {
       const response = await originalFetch.apply(this, args);
-      const endTime = performance.now();
-      const clone = response.clone();
-      let responseBody = null;
-      let size = 0;
-      try {
-        const text = await clone.text();
-        responseBody = text;
-        size = text.length;
-      } catch {}
+      const endTime = now();
       const responseHeaders = {};
-      response.headers.forEach((v, k) => { responseHeaders[k] = v; });
+      response.headers.forEach((value, name) => { responseHeaders[name] = value; });
 
-      sendToBridge('NET_RESPONSE', { url, status: response.status, statusText: response.statusText, responseHeaders, responseBody, endTime, size, startTime });
+      sendToBridge('NET_RESPONSE', {
+        captureId, url, status: response.status, statusText: response.statusText,
+        responseHeaders, responseBody: null, endTime,
+        size: Number.parseInt(response.headers.get('content-length'), 10) || null,
+      });
+
+      readResponseBody(response.clone()).then(result => {
+        sendToBridge('NET_RESPONSE_BODY', { captureId, ...result });
+      }).catch(() => {});
+
       return response;
-    } catch (err) {
-      sendToBridge('NET_ERROR', { url, error: err.message, endTime: performance.now(), startTime });
-      throw err;
+    } catch (error) {
+      sendToBridge('NET_ERROR', {
+        captureId, url, error: error.message, endTime: now(),
+      });
+      throw error;
     }
   };
 
-  // ============ 拦截 XMLHttpRequest ============
+  // ============ XMLHttpRequest ============
   const XHR = XMLHttpRequest.prototype;
   const originalOpen = XHR.open;
   const originalSend = XHR.send;
+  const originalAbort = XHR.abort;
   const originalSetRequestHeader = XHR.setRequestHeader;
 
   XHR.open = function(method, url, ...rest) {
-    this._netCatcher = { method: method.toUpperCase(), url, requestHeaders: {}, startTime: performance.now() };
+    this._netCatcher = {
+      method: String(method).toUpperCase(),
+      url: String(url),
+      requestHeaders: {},
+      async: rest.length === 0 || rest[0] !== false,
+      aborted: false,
+    };
     return originalOpen.apply(this, [method, url, ...rest]);
   };
 
@@ -78,10 +180,62 @@
     return originalSetRequestHeader.apply(this, [name, value]);
   };
 
+  XHR.abort = function() {
+    if (this._netCatcher) this._netCatcher.aborted = true;
+    return originalAbort.apply(this);
+  };
+
+  function completeMockXhr(xhr, nc, mock) {
+    nc.mocked = true;
+    const status = Number(mock.status) || 200;
+    const body = String(mock.body ?? '');
+    const headers = normalizeHeaders(mock.headers);
+    let readyState = 1;
+    let response = body;
+
+    if (xhr.responseType === 'json') {
+      try { response = JSON.parse(body); } catch { response = null; }
+    } else if (xhr.responseType === 'arraybuffer') {
+      response = new TextEncoder().encode(body).buffer;
+    } else if (xhr.responseType === 'blob') {
+      response = new Blob([body], { type: headers['content-type'] || 'text/plain' });
+    }
+
+    const values = {
+      readyState: () => readyState,
+      status: () => status,
+      statusText: () => 'Mocked',
+      response: () => response,
+      responseText: () => body,
+      responseURL: () => nc.url,
+      responseXML: () => null,
+    };
+    Object.entries(values).forEach(([name, get]) => {
+      try { Object.defineProperty(xhr, name, { configurable: true, get }); } catch {}
+    });
+
+    xhr.getResponseHeader = name => headers[String(name).toLowerCase()] ?? null;
+    xhr.getAllResponseHeaders = () => Object.entries(headers)
+      .map(([name, value]) => `${name}: ${value}\r\n`).join('');
+
+    const total = new TextEncoder().encode(body).byteLength;
+    xhr.dispatchEvent(new ProgressEvent('loadstart', { lengthComputable: true, loaded: 0, total }));
+    [2, 3, 4].forEach(state => {
+      readyState = state;
+      xhr.dispatchEvent(new Event('readystatechange'));
+    });
+    xhr.dispatchEvent(new ProgressEvent('progress', { lengthComputable: true, loaded: total, total }));
+    xhr.dispatchEvent(new ProgressEvent('load', { lengthComputable: true, loaded: total, total }));
+    xhr.dispatchEvent(new ProgressEvent('loadend', { lengthComputable: true, loaded: total, total }));
+  }
+
   XHR.send = function(body) {
     if (!this._netCatcher) return originalSend.apply(this, [body]);
 
+    const xhr = this;
     const nc = this._netCatcher;
+    nc.captureId = createCaptureId('http');
+    nc.startTime = now();
     nc.requestBody = null;
     if (body) {
       if (typeof body === 'string') nc.requestBody = body;
@@ -90,19 +244,14 @@
       else try { nc.requestBody = JSON.stringify(body); } catch {}
     }
 
-    sendToBridge('NET_REQUEST', {
-      url: nc.url, method: nc.method, requestHeaders: nc.requestHeaders,
-      requestBody: nc.requestBody, startTime: nc.startTime, type: 'xhr',
-    });
-
     this.addEventListener('load', function() {
-      const endTime = performance.now();
+      if (nc.mocked) return;
       const responseHeaders = {};
-      const headerStr = this.getAllResponseHeaders();
-      if (headerStr) {
-        headerStr.split('\r\n').forEach(line => {
-          const idx = line.indexOf(':');
-          if (idx > 0) responseHeaders[line.slice(0, idx).trim().toLowerCase()] = line.slice(idx + 1).trim();
+      const headerString = this.getAllResponseHeaders();
+      if (headerString) {
+        headerString.split('\r\n').forEach(line => {
+          const index = line.indexOf(':');
+          if (index > 0) responseHeaders[line.slice(0, index).trim().toLowerCase()] = line.slice(index + 1).trim();
         });
       }
       let responseBody = null;
@@ -110,154 +259,113 @@
       catch { responseBody = String(this.response); }
 
       sendToBridge('NET_RESPONSE', {
-        url: nc.url, status: this.status, statusText: this.statusText,
-        responseHeaders, responseBody, endTime, size: responseBody ? responseBody.length : 0, startTime: nc.startTime,
+        captureId: nc.captureId, url: nc.url, status: this.status, statusText: this.statusText,
+        responseHeaders, responseBody, endTime: now(),
+        size: responseBody ? responseBody.length : 0,
       });
     });
 
     this.addEventListener('error', function() {
-      sendToBridge('NET_ERROR', { url: nc.url, error: 'Network Error', endTime: performance.now(), startTime: nc.startTime });
+      if (!nc.mocked) sendToBridge('NET_ERROR', {
+        captureId: nc.captureId, url: nc.url, error: 'Network Error', endTime: now(),
+      });
     });
-
     this.addEventListener('abort', function() {
-      sendToBridge('NET_ERROR', { url: nc.url, error: 'Aborted', endTime: performance.now(), startTime: nc.startTime });
+      if (!nc.mocked) sendToBridge('NET_ERROR', {
+        captureId: nc.captureId, url: nc.url, error: 'Aborted', endTime: now(),
+      });
     });
 
-    return originalSend.apply(this, [body]);
+    const requestData = {
+      captureId: nc.captureId, url: nc.url, method: nc.method,
+      requestHeaders: nc.requestHeaders, requestBody: nc.requestBody,
+      startTime: nc.startTime, type: 'xhr', allowMock: nc.async,
+    };
+
+    if (!nc.async) {
+      sendToBridge('NET_REQUEST', requestData);
+      return originalSend.apply(this, [body]);
+    }
+
+    requestBridge('NET_REQUEST', requestData).then(registration => {
+      if (nc.aborted) return;
+      if (registration?.mocked && registration.mockResponse) {
+        completeMockXhr(xhr, nc, registration.mockResponse);
+      } else {
+        originalSend.apply(xhr, [body]);
+      }
+    }).catch(() => originalSend.apply(xhr, [body]));
   };
 
-  // ============ 拦截 WebSocket ============
+  // ============ WebSocket ============
   const OriginalWebSocket = window.WebSocket;
 
   window.WebSocket = function(url, protocols) {
-    const startTime = performance.now();
-    const wsUrl = typeof url === 'string' ? url : url.toString();
-    const wsId = ++requestCounter;
+    const startTime = now();
+    const wsUrl = String(url);
+    const wsId = createCaptureId('ws');
+    const ws = protocols !== undefined ? new OriginalWebSocket(url, protocols) : new OriginalWebSocket(url);
 
     sendToBridge('WS_OPEN', { id: wsId, url: wsUrl, startTime, protocols: protocols || null });
 
-    const ws = protocols ? new OriginalWebSocket(url, protocols) : new OriginalWebSocket(url);
-
-    // 拦截 send
-    const originalSend = ws.send.bind(ws);
+    const originalWsSend = ws.send.bind(ws);
     ws.send = function(data) {
-      let messageData = null;
+      let messageData;
       let messageType = 'text';
-
-      if (typeof data === 'string') {
-        messageData = data;
-      } else if (data instanceof ArrayBuffer) {
-        messageData = '[ArrayBuffer ' + data.byteLength + ' bytes]';
+      if (typeof data === 'string') messageData = data;
+      else if (data instanceof ArrayBuffer) {
+        messageData = `[ArrayBuffer ${data.byteLength} bytes]`;
         messageType = 'binary';
       } else if (data instanceof Blob) {
-        messageData = '[Blob ' + data.size + ' bytes]';
+        messageData = `[Blob ${data.size} bytes]`;
         messageType = 'binary';
-      } else if (data instanceof ArrayBufferView) {
-        messageData = '[ArrayBufferView ' + data.byteLength + ' bytes]';
+      } else if (ArrayBuffer.isView(data)) {
+        messageData = `[ArrayBufferView ${data.byteLength} bytes]`;
         messageType = 'binary';
       } else {
         try { messageData = String(data); } catch { messageData = '[Unknown data]'; }
       }
-
-      sendToBridge('WS_MESSAGE', { id: wsId, url: wsUrl, direction: 'send', messageType, data: messageData, timestamp: performance.now() });
-      return originalSend(data);
+      sendToBridge('WS_MESSAGE', {
+        id: wsId, direction: 'send', messageType, data: messageData, timestamp: now(),
+      });
+      return originalWsSend(data);
     };
 
-    // 拦截 onmessage - 只在用户设置时监听
-    let userOnMessage = null;
-    let onMessageListenerAdded = false;
-
-    Object.defineProperty(ws, 'onmessage', {
-      get: () => userOnMessage,
-      set: (handler) => {
-        userOnMessage = handler;
-        if (handler && !onMessageListenerAdded) {
-          onMessageListenerAdded = true;
-          ws.addEventListener('message', function(event) {
-            if (userOnMessage) {
-              sendToBridge('WS_MESSAGE', {
-                id: wsId, url: wsUrl, direction: 'receive',
-                messageType: typeof event.data === 'string' ? 'text' : 'binary',
-                data: typeof event.data === 'string' ? event.data : '[binary data]',
-                timestamp: performance.now(),
-              });
-            }
-          });
-        }
-      },
-    });
-
-    // 用 addEventListener 监听（捕获所有消息，包括用 addEventListener 注册的）
-    // 这是主要的消息捕获方式
-    ws.addEventListener('message', function(event) {
-      // 避免与 onmessage handler 重复
-      // 只有当用户没有设置 onmessage 时，才在这里发送
-      if (userOnMessage) return; // onmessage handler 会处理
-
-      let messageData = null;
+    ws.addEventListener('message', event => {
+      let data;
       let messageType = 'text';
-
-      if (typeof event.data === 'string') {
-        messageData = event.data;
-      } else if (event.data instanceof ArrayBuffer) {
-        messageData = '[ArrayBuffer ' + event.data.byteLength + ' bytes]';
+      if (typeof event.data === 'string') data = event.data;
+      else if (event.data instanceof ArrayBuffer) {
+        data = `[ArrayBuffer ${event.data.byteLength} bytes]`;
         messageType = 'binary';
       } else if (event.data instanceof Blob) {
-        messageData = '[Blob ' + event.data.size + ' bytes]';
+        data = `[Blob ${event.data.size} bytes]`;
         messageType = 'binary';
       } else {
-        try { messageData = String(event.data); } catch { messageData = '[Unknown data]'; }
+        data = '[binary data]';
+        messageType = 'binary';
       }
-
-      sendToBridge('WS_MESSAGE', { id: wsId, url: wsUrl, direction: 'receive', messageType, data: messageData, timestamp: performance.now() });
+      sendToBridge('WS_MESSAGE', {
+        id: wsId, direction: 'receive', messageType, data, timestamp: now(),
+      });
     });
 
-    // 拦截 onclose
-    let userOnClose = null;
-    Object.defineProperty(ws, 'onclose', {
-      get: () => userOnClose,
-      set: (handler) => {
-        userOnClose = handler;
-        if (handler) {
-          ws.addEventListener('close', function(event) {
-            sendToBridge('WS_CLOSE', { id: wsId, url: wsUrl, code: event.code, reason: event.reason, wasClean: event.wasClean, timestamp: performance.now(), startTime });
-          });
-        }
-      },
+    ws.addEventListener('close', event => {
+      sendToBridge('WS_CLOSE', {
+        id: wsId, code: event.code, reason: event.reason,
+        wasClean: event.wasClean, timestamp: now(),
+      });
     });
-
-    // 拦截 onerror
-    let userOnError = null;
-    Object.defineProperty(ws, 'onerror', {
-      get: () => userOnError,
-      set: (handler) => {
-        userOnError = handler;
-        if (handler) {
-          ws.addEventListener('error', function() {
-            sendToBridge('WS_ERROR', { id: wsId, url: wsUrl, timestamp: performance.now(), startTime });
-          });
-        }
-      },
-    });
-
-    // 用 addEventListener 监听 close 和 error（总是添加，不会重复因为事件只触发一次）
-    ws.addEventListener('close', function(event) {
-      sendToBridge('WS_CLOSE', { id: wsId, url: wsUrl, code: event.code, reason: event.reason, wasClean: event.wasClean, timestamp: performance.now(), startTime });
-    });
-
-    ws.addEventListener('error', function() {
-      sendToBridge('WS_ERROR', { id: wsId, url: wsUrl, timestamp: performance.now(), startTime });
+    ws.addEventListener('error', () => {
+      sendToBridge('WS_ERROR', { id: wsId, timestamp: now() });
     });
 
     return ws;
   };
 
-  // 复制静态属性
   window.WebSocket.CONNECTING = OriginalWebSocket.CONNECTING;
   window.WebSocket.OPEN = OriginalWebSocket.OPEN;
   window.WebSocket.CLOSING = OriginalWebSocket.CLOSING;
   window.WebSocket.CLOSED = OriginalWebSocket.CLOSED;
   window.WebSocket.prototype = OriginalWebSocket.prototype;
-
-  console.log('[NetCatcher] MAIN world interceptor loaded');
 })();

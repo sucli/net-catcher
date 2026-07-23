@@ -30,9 +30,10 @@
 - 请求分组（按域名折叠）
 
 ### ⚡ 性能优化
-- 请求去重（避免轮询刷屏）
+- 全局唯一 ID 精确关联请求与响应
 - WebSocket 消息数量限制
 - 内存自动清理
+- 响应体异步采集（单条最多保留 1 MB，不阻塞流式响应）
 
 ### 📋 其他功能
 - 请求对比（Ctrl+Click 多选两个请求）
@@ -121,18 +122,12 @@ Chrome MV3 的 Content Script 有两种 world：
 - `content_script_main.js`（MAIN）拦截请求 → `postMessage`
 - `content_script_bridge.js`（ISOLATED）接收 → `chrome.runtime.sendMessage`
 
-### 请求去重
+### 精确请求关联
 
-同一 URL 短时间内多次请求（如轮询），自动去重避免刷屏：
+每个页面和 frame 使用全局唯一 ID 关联请求与响应，避免并发请求、跨标签页请求相互覆盖：
 
 ```javascript
-function isDuplicateRequest(url, startTime) {
-  const threshold = 50; // 50ms
-  return requests.some(r =>
-    r.url === url &&
-    Math.abs(r.startTime - startTime) < threshold
-  );
-}
+const captureId = crypto.randomUUID();
 ```
 
 ### 时间线可视化
@@ -146,6 +141,7 @@ function isDuplicateRequest(url, startTime) {
 
 | 版本 | 日期 | 更新内容 |
 |------|------|---------|
+| 2.0.1 | 2026-07-17 | 修复 Mock、WebSocket 事件、跨页面关联和消息权限问题 |
 | 2.0.0 | 2026-06-17 | 重放、Mock、时间线、对比、分组、过滤器保存 |
 | 1.2.0 | 2026-06-17 | WebSocket 抓包 |
 | 1.1.1 | 2026-06-17 | 修复列表渲染 Bug |

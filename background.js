@@ -4,6 +4,10 @@
 const MAX_REQUESTS = 500;
 const MAX_WS_CONNECTIONS = 100;
 const MAX_WS_MESSAGES = 200;
+const CAPTURE_TYPES = new Set([
+  'NET_REQUEST', 'NET_RESPONSE', 'NET_RESPONSE_BODY', 'NET_ERROR',
+  'WS_OPEN', 'WS_MESSAGE', 'WS_CLOSE', 'WS_ERROR',
+]);
 let requests = [];
 let wsConnections = new Map();
 let isCapturing = true;
@@ -11,11 +15,11 @@ let requestId = 0;
 let mockRules = [];
 let savedFilters = [];
 
-// 初始化：从存储恢复数据
-chrome.storage.local.get([
+// Wait for persisted state before handling events after a service-worker wake-up.
+const initialization = chrome.storage.local.get([
   'nc_requests', 'nc_wsConnections', 'nc_requestId', 'nc_isCapturing',
   'nc_mockRules', 'nc_savedFilters'
-], (data) => {
+]).then(data => {
   if (data.nc_requests) requests = data.nc_requests;
   if (data.nc_requestId) requestId = data.nc_requestId;
   if (data.nc_isCapturing !== undefined) isCapturing = data.nc_isCapturing;
@@ -27,7 +31,7 @@ chrome.storage.local.get([
       arr.forEach(conn => wsConnections.set(conn.id, conn));
     } catch {}
   }
-});
+}).catch(() => {});
 
 // 持久化存储
 function persist() {
@@ -49,13 +53,22 @@ function persist() {
   });
 }
 
-// 请求去重：检查是否是重复请求
-function isDuplicateRequest(url, startTime) {
-  const threshold = 50; // 50ms 内的相同 URL 视为重复
-  return requests.some(r =>
-    r.url === url &&
-    Math.abs(r.startTime - startTime) < threshold &&
-    r.endTime === null
+function isContentScriptSender(sender) {
+  return sender.id === chrome.runtime.id && Number.isInteger(sender.tab?.id);
+}
+
+function isExtensionPageSender(sender) {
+  return sender.id === chrome.runtime.id &&
+    !sender.tab &&
+    typeof sender.url === 'string' &&
+    sender.url.startsWith(chrome.runtime.getURL(''));
+}
+
+function findCapturedRequest(data, sender) {
+  return requests.find(request =>
+    request.captureId === data.captureId &&
+    request.tabId === sender.tab.id &&
+    request.frameId === sender.frameId
   );
 }
 
@@ -78,33 +91,49 @@ function matchMockRule(url) {
 function getMockResponse(url) {
   const rule = matchMockRule(url);
   if (!rule) return null;
+  const parsedStatus = Number.parseInt(rule.status, 10);
   return {
-    status: rule.status,
+    status: Number.isInteger(parsedStatus) && parsedStatus >= 200 && parsedStatus <= 599 ? parsedStatus : 200,
     headers: rule.headers,
     body: rule.body,
   };
 }
 
-// 消息处理
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+function handleMessage(msg, sender, sendResponse) {
+  if (!msg || typeof msg.type !== 'string') {
+    sendResponse({ error: '无效消息' });
+    return;
+  }
+
+  if (CAPTURE_TYPES.has(msg.type)) {
+    if (!isContentScriptSender(sender) || !msg.data || typeof msg.data !== 'object') {
+      sendResponse({ error: '禁止的捕获消息' });
+      return;
+    }
+  } else if (!isExtensionPageSender(sender)) {
+    sendResponse({ error: '禁止的扩展命令' });
+    return;
+  }
+
   // ============ HTTP 请求相关 ============
 
   if (msg.type === 'NET_REQUEST') {
     if (!isCapturing) { sendResponse(null); return; }
-
-    // 请求去重
-    if (isDuplicateRequest(msg.data.url, msg.data.startTime)) {
+    if (typeof msg.data.captureId !== 'string' || typeof msg.data.url !== 'string') {
       sendResponse(null);
       return;
     }
 
     // 检查是否有匹配的 Mock 规则
-    const mockResponse = getMockResponse(msg.data.url);
+    const mockResponse = msg.data.allowMock === false ? null : getMockResponse(msg.data.url);
+    const rawMethod = String(msg.data.method || 'GET').toUpperCase();
+    const method = /^[!#$%&'*+.^_`|~0-9A-Z-]{1,32}$/.test(rawMethod) ? rawMethod : 'UNKNOWN';
 
     const entry = {
       id: ++requestId,
+      captureId: msg.data.captureId,
       url: msg.data.url,
-      method: msg.data.method,
+      method,
       status: null,
       statusText: '',
       requestHeaders: msg.data.requestHeaders || {},
@@ -115,8 +144,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       endTime: null,
       duration: null,
       size: null,
-      type: msg.data.type || 'xhr',
-      tabId: sender.tab ? sender.tab.id : null,
+      type: msg.data.type === 'fetch' ? 'fetch' : 'xhr',
+      tabId: sender.tab.id,
+      frameId: sender.frameId,
       starred: false,
       tags: [],
       isMocked: !!mockResponse,
@@ -132,31 +162,42 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       entry.statusText = 'Mocked';
       entry.responseHeaders = mockResponse.headers || {};
       entry.responseBody = mockResponse.body;
-      entry.endTime = msg.data.startTime + 1; // 模拟 1ms 响应
-      entry.duration = 1;
+      entry.endTime = Date.now();
+      entry.duration = Math.max(0, entry.endTime - entry.startTime);
       entry.size = mockResponse.body ? mockResponse.body.length : 0;
     }
 
     persist();
     broadcastUpdate();
-    sendResponse({ id: entry.id, mocked: !!mockResponse });
+    sendResponse({ id: entry.id, mocked: !!mockResponse, mockResponse });
     return true;
   }
 
   if (msg.type === 'NET_RESPONSE') {
-    const entry = requests.find(r =>
-      r.url === msg.data.url &&
-      Math.abs(r.startTime - msg.data.startTime) < 1 &&
-      r.endTime === null
-    );
+    const entry = findCapturedRequest(msg.data, sender);
     if (entry) {
-      entry.status = msg.data.status;
-      entry.statusText = msg.data.statusText;
+      entry.status = Number.isFinite(msg.data.status) ? msg.data.status : 0;
+      entry.statusText = String(msg.data.statusText || '');
       entry.responseHeaders = msg.data.responseHeaders || {};
       entry.responseBody = msg.data.responseBody;
       entry.endTime = msg.data.endTime;
       entry.duration = msg.data.endTime - entry.startTime;
-      entry.size = msg.data.size || (msg.data.responseBody ? msg.data.responseBody.length : 0);
+      entry.size = msg.data.size ?? (msg.data.responseBody ? msg.data.responseBody.length : null);
+      persist();
+      broadcastUpdate();
+    }
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (msg.type === 'NET_RESPONSE_BODY') {
+    const entry = findCapturedRequest(msg.data, sender);
+    if (entry && !entry.isMocked) {
+      entry.responseBody = msg.data.body ?? null;
+      if (Number.isFinite(msg.data.size) && (!msg.data.truncated || !entry.size)) {
+        entry.size = msg.data.size;
+      }
+      entry.bodyTruncated = !!msg.data.truncated;
       persist();
       broadcastUpdate();
     }
@@ -165,11 +206,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'NET_ERROR') {
-    const entry = requests.find(r =>
-      r.url === msg.data.url &&
-      Math.abs(r.startTime - msg.data.startTime) < 1 &&
-      r.endTime === null
-    );
+    const entry = findCapturedRequest(msg.data, sender);
     if (entry) {
       entry.status = 0;
       entry.statusText = msg.data.error || 'Network Error';
@@ -186,12 +223,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === 'WS_OPEN') {
     if (!isCapturing) { sendResponse(null); return; }
+    if (typeof msg.data.id !== 'string' || typeof msg.data.url !== 'string') {
+      sendResponse(null);
+      return;
+    }
     const conn = {
       id: msg.data.id,
       url: msg.data.url,
       protocols: msg.data.protocols,
       startTime: msg.data.startTime,
       tabId: sender.tab ? sender.tab.id : null,
+      frameId: sender.frameId,
       status: 'open',
       closeCode: null,
       closeReason: '',
@@ -212,14 +254,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === 'WS_MESSAGE') {
     const conn = wsConnections.get(msg.data.id);
-    if (conn) {
+    if (conn && conn.tabId === sender.tab.id && conn.frameId === sender.frameId) {
       conn.messages.push({
         direction: msg.data.direction,
-        type: msg.data.messageType,
+        type: msg.data.messageType === 'binary' ? 'binary' : 'text',
         data: msg.data.data,
         timestamp: msg.data.timestamp,
       });
-      conn.messageCount[msg.data.direction]++;
+      if (msg.data.direction === 'send' || msg.data.direction === 'receive') {
+        conn.messageCount[msg.data.direction]++;
+      }
       persist();
       broadcastUpdate();
     }
@@ -229,7 +273,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === 'WS_CLOSE') {
     const conn = wsConnections.get(msg.data.id);
-    if (conn) {
+    if (conn && conn.tabId === sender.tab.id && conn.frameId === sender.frameId) {
       conn.status = 'closed';
       conn.closeCode = msg.data.code;
       conn.closeReason = msg.data.reason;
@@ -245,7 +289,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === 'WS_ERROR') {
     const conn = wsConnections.get(msg.data.id);
-    if (conn) {
+    if (conn && conn.tabId === sender.tab.id && conn.frameId === sender.frameId) {
       conn.status = 'error';
       conn.endTime = msg.data.timestamp;
       conn.duration = msg.data.timestamp - conn.startTime;
@@ -418,6 +462,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
     return true;
   }
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  initialization
+    .then(() => handleMessage(msg, sender, sendResponse))
+    .catch(error => sendResponse({ error: error.message }));
+  return true;
 });
 
 function broadcastUpdate() {
@@ -458,7 +509,7 @@ function generateHAR(requests) {
   return {
     log: {
       version: '1.2',
-      creator: { name: 'NetCatcher', version: '2.0.0' },
+      creator: { name: 'NetCatcher', version: chrome.runtime.getManifest().version },
       entries,
     },
   };
