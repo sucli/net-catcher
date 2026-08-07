@@ -96,6 +96,7 @@ function loadMainScript({ responder, fetchImpl = async () => new Response('ok') 
     ArrayBuffer,
     TextDecoder,
     TextEncoder,
+    btoa,
     URL,
     Event,
     ProgressEvent: FakeProgressEvent,
@@ -330,13 +331,35 @@ test('WebSocket page handlers still run and capture IDs use absolute time', () =
 function createBackgroundHarness(storageData = {}, storageSet = null) {
   let listener;
   const writes = [];
+  const createEvent = () => {
+    const listeners = [];
+    return {
+      listeners,
+      addListener(value) { listeners.push(value); },
+      emit(value) { return listeners.map(listener => listener(value)); },
+    };
+  };
+  const webRequest = {
+    onBeforeRequest: createEvent(),
+    onBeforeSendHeaders: createEvent(),
+    onHeadersReceived: createEvent(),
+    onBeforeRedirect: createEvent(),
+    onCompleted: createEvent(),
+    onErrorOccurred: createEvent(),
+  };
   const chrome = {
     storage: {
       local: {
         get: async () => storageData,
-        set: data => { writes.push(data); return storageSet ? storageSet(data) : Promise.resolve(); },
+        set: data => {
+          writes.push(data);
+          if (!storageSet) Object.assign(storageData, data);
+          return storageSet ? storageSet(data) : Promise.resolve();
+        },
+        remove: async key => { delete storageData[key]; },
       },
     },
+    webRequest,
     runtime: {
       id: 'extension-id',
       getURL: suffix => `chrome-extension://extension-id/${suffix}`,
@@ -351,7 +374,7 @@ function createBackgroundHarness(storageData = {}, storageSet = null) {
   });
 
   const dispatch = (message, sender) => new Promise(resolve => listener(message, sender, resolve));
-  return { dispatch, writes };
+  return { dispatch, writes, webRequest };
 }
 
 test('background rejects control commands from content scripts and correlates by capture ID', async () => {
@@ -502,4 +525,189 @@ test('HAR export includes query parameters and request MIME type', async () => {
   const entry = result.har.log.entries[0];
   assert.equal(JSON.stringify(entry.request.queryString), JSON.stringify([{ name: 'a', value: '1' }, { name: 'b', value: 'two' }]));
   assert.equal(entry.request.postData.mimeType, 'application/x-www-form-urlencoded');
+});
+
+test('webRequest metadata is captured and merged with page-level fetch events', async () => {
+  const { dispatch, webRequest } = createBackgroundHarness();
+  const popupSender = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' };
+  await dispatch({ type: 'GET_REQUESTS' }, popupSender);
+  webRequest.onBeforeRequest.emit({
+    requestId: 'network-1', url: 'https://example.test/app.js', method: 'GET',
+    type: 'script', tabId: 8, frameId: 0, timeStamp: 100,
+  });
+  webRequest.onHeadersReceived.emit({
+    requestId: 'network-1', statusCode: 200, statusLine: 'HTTP/1.1 200 OK', timeStamp: 110,
+    responseHeaders: [{ name: 'content-type', value: 'application/javascript' }],
+  });
+  webRequest.onCompleted.emit({ requestId: 'network-1', statusCode: 200, timeStamp: 130 });
+
+  webRequest.onBeforeRequest.emit({
+    requestId: 'network-2', url: 'https://example.test/data', method: 'GET',
+    type: 'fetch', tabId: 8, frameId: 0, timeStamp: 200,
+  });
+  const sender = { id: 'extension-id', tab: { id: 8 }, frameId: 0 };
+  await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'page-fetch', url: 'https://example.test/data', method: 'GET', startTime: 200, type: 'fetch',
+  } }, sender);
+  webRequest.onCompleted.emit({ requestId: 'network-2', statusCode: 204, timeStamp: 220 });
+
+  const result = await dispatch({ type: 'GET_REQUESTS', data: { tabId: 8 } }, popupSender);
+  assert.equal(result.requests.length, 2);
+  assert.equal(result.requests.find(request => request.resourceType === 'script').status, 200);
+  const merged = result.requests.find(request => request.captureId === 'page-fetch');
+  assert.equal(merged.webRequestId, 'network-2');
+  assert.equal(merged.status, 204);
+});
+
+test('named sessions isolate capture data and expose session metadata', async () => {
+  const { dispatch } = createBackgroundHarness();
+  const popupSender = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' };
+  const sender = { id: 'extension-id', tab: { id: 10 }, frameId: 0 };
+  await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'session-a', url: 'https://example.test/a', startTime: 1, type: 'fetch',
+  } }, sender);
+  const created = await dispatch({ type: 'CREATE_SESSION', data: { name: '回归测试' } }, popupSender);
+  assert.equal(created.ok, true);
+  assert.equal(created.sessions.length, 2);
+  let current = await dispatch({ type: 'GET_REQUESTS' }, popupSender);
+  assert.equal(current.activeSessionId, created.activeSessionId);
+  assert.equal(current.requests.length, 0);
+  const switched = await dispatch({ type: 'SWITCH_SESSION', data: { id: 'default' } }, popupSender);
+  assert.equal(switched.ok, true);
+  current = await dispatch({ type: 'GET_REQUESTS' }, popupSender);
+  assert.equal(current.requests.length, 1);
+  assert.equal(current.requests[0].captureId, 'session-a');
+});
+
+test('HAR import keeps requests in the selected tab and batch replay returns per-request results', async () => {
+  const { dispatch } = createBackgroundHarness();
+  const popupSender = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' };
+  const imported = await dispatch({ type: 'IMPORT_HAR', data: {
+    tabId: 11,
+    har: { log: { entries: [{
+      startedDateTime: new Date(100).toISOString(), time: 4,
+      request: { method: 'POST', url: 'https://example.test/imported', headers: [{ name: 'x-test', value: '1' }], postData: { text: 'a=1' } },
+      response: { status: 201, statusText: 'Created', headers: [], content: { text: '{"ok":true}', mimeType: 'application/json', size: 11 } },
+    }] } },
+  } }, popupSender);
+  assert.equal(imported.count, 1);
+  const current = await dispatch({ type: 'GET_REQUESTS', data: { tabId: 11 } }, popupSender);
+  assert.equal(current.requests[0].type, 'har');
+  assert.equal(current.requests[0].requestBody, 'a=1');
+  const replay = await dispatch({ type: 'REPLAY_BATCH', data: { ids: [imported.ids[0]] } }, popupSender);
+  assert.equal(replay.results.length, 1);
+  assert.equal(replay.results[0].status, 200);
+});
+
+test('Mock rules can match query, headers and body, and simulate errors', async () => {
+  const { dispatch } = createBackgroundHarness();
+  const popupSender = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' };
+  const sender = { id: 'extension-id', tab: { id: 12 }, frameId: 0 };
+  await dispatch({ type: 'ADD_MOCK_RULE', data: {
+    pattern: '/conditional', method: 'POST', priority: 20, status: 207,
+    matchQuery: { mode: 'test' }, matchHeaders: { 'x-mode': 'active' }, matchBody: 'needle', body: 'matched',
+  } }, popupSender);
+  const matched = await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'conditional', url: 'https://example.test/conditional?mode=test', method: 'POST',
+    requestHeaders: { 'x-mode': 'active' }, requestBody: 'needle', startTime: 1, type: 'fetch',
+  } }, sender);
+  assert.equal(matched.mocked, true);
+  assert.equal(matched.mockResponse.status, 207);
+  await dispatch({ type: 'ADD_MOCK_RULE', data: {
+    pattern: '/failure', action: 'error', error: 'forced failure', priority: 30,
+  } }, popupSender);
+  const failed = await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'failure', url: 'https://example.test/failure', method: 'GET', startTime: 1, type: 'fetch',
+  } }, sender);
+  assert.equal(failed.mockResponse.error, 'forced failure');
+});
+
+test('EventSource stream chunks accumulate in the captured response', async () => {
+  const { dispatch } = createBackgroundHarness();
+  const popupSender = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' };
+  const sender = { id: 'extension-id', tab: { id: 13 }, frameId: 0 };
+  await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'sse', url: 'https://example.test/events', method: 'GET', startTime: 1, type: 'eventsource',
+  } }, sender);
+  await dispatch({ type: 'NET_RESPONSE', data: {
+    captureId: 'sse', status: 200, statusText: 'OPEN', endTime: 2,
+    responseHeaders: { 'content-type': 'text/event-stream' },
+  } }, sender);
+  await dispatch({ type: 'NET_STREAM_CHUNK', data: {
+    captureId: 'sse', data: '{"event":1}', timestamp: 3, eventType: 'message', lastEventId: '1',
+  } }, sender);
+  const result = await dispatch({ type: 'GET_REQUESTS', data: { tabId: 13 } }, popupSender);
+  assert.equal(result.requests[0].responseBody, '{"event":1}');
+  assert.equal(result.requests[0].streamChunks[0].lastEventId, '1');
+});
+
+test('binary WebSocket messages retain encoding and hex metadata', async () => {
+  const { dispatch } = createBackgroundHarness();
+  const popupSender = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' };
+  const sender = { id: 'extension-id', tab: { id: 14 }, frameId: 0 };
+  await dispatch({ type: 'WS_OPEN', data: { id: 'ws-binary', url: 'wss://example.test', startTime: 1 } }, sender);
+  await dispatch({ type: 'WS_MESSAGE', data: {
+    id: 'ws-binary', direction: 'receive', messageType: 'binary', data: 'AQI=',
+    dataEncoding: 'base64', dataSize: 2, dataHex: '01 02', timestamp: 2,
+  } }, sender);
+  const result = await dispatch({ type: 'GET_WS_DETAIL', data: { id: 'ws-binary' } }, popupSender);
+  assert.equal(result.connection.messages[0].encoding, 'base64');
+  assert.equal(result.connection.messages[0].hex, '01 02');
+});
+
+test('GraphQL requests are identified from JSON bodies', async () => {
+  const { dispatch } = createBackgroundHarness();
+  const popupSender = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' };
+  const sender = { id: 'extension-id', tab: { id: 15 }, frameId: 0 };
+  await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'graphql', url: 'https://example.test/graphql', method: 'POST', startTime: 1, type: 'fetch',
+    requestHeaders: { 'content-type': 'application/json' },
+    requestBody: JSON.stringify({ operationName: 'GetUser', query: 'query GetUser { user { id } }', variables: { id: 1 } }),
+  } }, sender);
+  const result = await dispatch({ type: 'GET_REQUESTS', data: { tabId: 15 } }, popupSender);
+  assert.equal(result.requests[0].graphql.operationName, 'GetUser');
+  assert.equal(result.requests[0].graphql.variables.id, 1);
+});
+
+test('saved assertions run as a test scenario', async () => {
+  const { dispatch } = createBackgroundHarness();
+  const popupSender = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' };
+  const sender = { id: 'extension-id', tab: { id: 16 }, frameId: 0 };
+  await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'scenario-request', url: 'https://example.test/scenario', method: 'GET', startTime: 1, type: 'fetch',
+  } }, sender);
+  await dispatch({ type: 'UPDATE_ASSERTIONS', data: {
+    id: 1, assertions: { status: 200, maxDurationMs: 1000 },
+  } }, popupSender);
+  const saved = await dispatch({ type: 'SAVE_SCENARIO', data: { name: '健康检查', ids: [1] } }, popupSender);
+  assert.equal(saved.ok, true);
+  const run = await dispatch({ type: 'RUN_SCENARIO', data: { id: saved.scenarios[0].id } }, popupSender);
+  assert.equal(run.results.length, 1);
+  assert.equal(run.results[0].passed, true);
+});
+
+test('OpenAPI export groups captured requests by path and method', async () => {
+  const { dispatch } = createBackgroundHarness();
+  const popupSender = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' };
+  const sender = { id: 'extension-id', tab: { id: 17 }, frameId: 0 };
+  await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'openapi', url: 'https://example.test/users?id=1', method: 'GET', startTime: 1, type: 'fetch',
+  } }, sender);
+  await dispatch({ type: 'NET_RESPONSE', data: {
+    captureId: 'openapi', status: 200, statusText: 'OK', endTime: 2, responseHeaders: {}, responseBody: '[]',
+  } }, sender);
+  const result = await dispatch({ type: 'EXPORT_OPENAPI', data: { tabId: 17 } }, popupSender);
+  assert.equal(result.openapi.openapi, '3.0.3');
+  assert.equal(result.openapi.paths['/users'].get.responses['200'].description, 'OK');
+  assert.equal(result.openapi.paths['/users'].get.parameters[0].name, 'id');
+});
+
+test('page WebSocket binary sends a Base64 capture summary', () => {
+  const { window } = loadMainScript({ responder: () => null });
+  const socket = new window.WebSocket('wss://example.test/binary');
+  socket.send(new Uint8Array([1, 2, 3]));
+  const message = window.messages.find(item => item.type === 'WS_MESSAGE' && item.data.direction === 'send');
+  assert.equal(message.data.messageType, 'binary');
+  assert.equal(message.data.dataSize, 3);
+  assert.equal(message.data.dataHex, '01 02 03');
 });

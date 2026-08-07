@@ -1,11 +1,13 @@
 {
   "manifest_version": 3,
   "name": "NetCatcher",
-  "version": "2.1.0",
+  "version": "2.3.0",
   "description": "网络请求抓包与检查工具",
   "permissions": [
     "storage",
-    "tabs"
+    "tabs",
+    "webRequest",
+    "sidePanel"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {
@@ -33,6 +35,9 @@
       "48": "icons/icon48.svg",
       "128": "icons/icon128.svg"
     }
+  },
+  "side_panel": {
+    "default_path": "popup.html"
   },
   "icons": {
     "16": "icons/icon16.svg",

@@ -5,7 +5,7 @@
   'use strict';
 
   const CAPTURE_TYPES = new Set([
-    'NET_REQUEST', 'NET_RESPONSE', 'NET_RESPONSE_BODY', 'NET_ERROR',
+    'NET_REQUEST', 'NET_RESPONSE', 'NET_RESPONSE_BODY', 'NET_STREAM_CHUNK', 'NET_ERROR',
     'WS_OPEN', 'WS_READY', 'WS_MESSAGE', 'WS_CLOSE', 'WS_ERROR',
   ]);
   const bridgeNonce = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ? crypto.randomUUID() :
@@ -30,6 +30,9 @@
 
     chrome.runtime.onMessage.addListener(message => {
       if (message?.type === 'CAPTURE_CONFIG_UPDATED') publishCaptureConfig(message);
+      if (message?.type === 'WS_REPLAY' && message.data && typeof message.data === 'object') {
+        window.postMessage({ __netCatcher: true, type: 'WS_REPLAY', data: message.data, nonce: bridgeNonce }, '*');
+      }
     });
   }
 

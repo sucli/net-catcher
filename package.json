@@ -1,6 +1,6 @@
 {
   "name": "net-catcher",
-  "version": "2.1.0",
+  "version": "2.3.0",
   "private": true,
   "scripts": {
     "check": "node --check background.js && node --check content_script_bridge.js && node --check content_script_main.js && node --check popup.js",

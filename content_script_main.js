@@ -12,6 +12,7 @@
   let bridgeNonce = null;
   let bridgeNoncePromise = null;
   let bridgeNonceResolve = null;
+  const wsInstances = new Map();
 
   function waitForBridgeNonce() {
     if (bridgeNonce) return Promise.resolve(bridgeNonce);
@@ -81,6 +82,13 @@
       mockDecisionRequired = !!event.data.hasActiveMockRules;
       return;
     }
+    if (event.data?.__netCatcher && event.data.type === 'WS_REPLAY') {
+      if (event.data.nonce !== bridgeNonce) return;
+      const socket = wsInstances.get(event.data.data?.id);
+      if (!socket || socket.readyState !== OriginalWebSocket.OPEN) return;
+      try { socket.send(event.data.data.data); } catch {}
+      return;
+    }
     if (!event.data?.__netCatcherResponse) return;
     if (event.data.nonce !== bridgeNonce) return;
     const resolve = pendingBridgeRequests.get(event.data.messageId);
@@ -113,6 +121,16 @@
     try { return JSON.stringify(body); } catch { return null; }
   }
 
+  function serializeBeaconBody(body) {
+    if (body === undefined || body === null) return null;
+    if (typeof body === 'string') return body;
+    if (body instanceof URLSearchParams) return body.toString();
+    if (body instanceof Blob) return `[Blob ${body.size} bytes]`;
+    if (body instanceof ArrayBuffer) return `[ArrayBuffer ${body.byteLength} bytes]`;
+    if (body instanceof FormData) return '[FormData]';
+    try { return JSON.stringify(body); } catch { return null; }
+  }
+
   function bytesToBase64(buffer) {
     if (typeof btoa !== 'function') return null;
     const bytes = new Uint8Array(buffer);
@@ -122,6 +140,40 @@
       binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
     }
     return btoa(binary);
+  }
+
+  function bytesToHex(buffer, maxBytes = 256) {
+    const bytes = new Uint8Array(buffer).slice(0, maxBytes);
+    return Array.from(bytes, value => value.toString(16).padStart(2, '0')).join(' ');
+  }
+
+  function captureWebSocketMessage(id, direction, data) {
+    if (typeof data === 'string') {
+      sendToBridge('WS_MESSAGE', { id, direction, messageType: 'text', data, timestamp: now() });
+      return;
+    }
+    const publishBinary = buffer => {
+      const base64 = bytesToBase64(buffer);
+      sendToBridge('WS_MESSAGE', {
+        id, direction, messageType: 'binary', data: base64 || `[Binary ${buffer.byteLength} bytes]`,
+        dataEncoding: base64 ? 'base64' : 'summary', dataSize: buffer.byteLength,
+        dataHex: bytesToHex(buffer), timestamp: now(),
+      });
+    };
+    if (data instanceof ArrayBuffer) {
+      publishBinary(data);
+    } else if (ArrayBuffer.isView(data)) {
+      publishBinary(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+    } else if (data instanceof Blob) {
+      data.arrayBuffer().then(publishBinary).catch(() => {
+        sendToBridge('WS_MESSAGE', {
+          id, direction, messageType: 'binary', data: `[Blob ${data.size} bytes]`,
+          dataEncoding: 'summary', dataSize: data.size, timestamp: now(),
+        });
+      });
+    } else {
+      sendToBridge('WS_MESSAGE', { id, direction, messageType: 'text', data: String(data), timestamp: now() });
+    }
   }
 
   async function readResponseBody(response) {
@@ -214,6 +266,7 @@
     if (registration?.mocked && registration.mockResponse) {
       const delay = Math.max(0, Number(registration.mockResponse.delay) || 0);
       if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+      if (registration.mockResponse.error) throw new TypeError(registration.mockResponse.error);
       return createMockResponse(url, registration.mockResponse);
     }
 
@@ -241,6 +294,59 @@
       throw error;
     }
   };
+
+  // ============ EventSource / Beacon ============
+  const OriginalEventSource = window.EventSource;
+  if (typeof OriginalEventSource === 'function') {
+    window.EventSource = function(url, configuration) {
+      const captureId = createCaptureId('http');
+      let normalizedUrl = String(url);
+      try { normalizedUrl = new URL(normalizedUrl, window.location?.href).href; } catch {}
+      sendToBridge('NET_REQUEST', {
+        captureId, url: normalizedUrl, method: 'GET', requestHeaders: {}, requestBody: null,
+        startTime: now(), type: 'eventsource',
+      });
+      const source = configuration === undefined ? new OriginalEventSource(url) :
+        new OriginalEventSource(url, configuration);
+      source.addEventListener('open', () => {
+        sendToBridge('NET_RESPONSE', {
+          captureId, url: normalizedUrl, status: 200, statusText: 'OPEN',
+          responseHeaders: { 'content-type': 'text/event-stream' }, responseBody: null,
+          endTime: now(), size: null,
+        });
+      });
+      source.addEventListener('message', event => {
+        sendToBridge('NET_STREAM_CHUNK', {
+          captureId, url: normalizedUrl, data: event.data, body: event.data,
+          eventType: event.type, lastEventId: event.lastEventId, timestamp: now(),
+          bodyMimeType: 'text/event-stream',
+        });
+      });
+      source.addEventListener('error', () => {
+        if (source.readyState === OriginalEventSource.CLOSED) {
+          sendToBridge('NET_ERROR', { captureId, url: normalizedUrl, error: 'EventSource closed', endTime: now() });
+        }
+      });
+      return source;
+    };
+    window.EventSource.CONNECTING = OriginalEventSource.CONNECTING;
+    window.EventSource.OPEN = OriginalEventSource.OPEN;
+    window.EventSource.CLOSED = OriginalEventSource.CLOSED;
+    window.EventSource.prototype = OriginalEventSource.prototype;
+  }
+
+  if (window.navigator?.sendBeacon) {
+    const originalSendBeacon = window.navigator.sendBeacon.bind(window.navigator);
+    window.navigator.sendBeacon = function(url, body) {
+      let normalizedUrl = String(url);
+      try { normalizedUrl = new URL(normalizedUrl, window.location?.href).href; } catch {}
+      sendToBridge('NET_REQUEST', {
+        captureId: createCaptureId('http'), url: normalizedUrl, method: 'POST',
+        requestHeaders: {}, requestBody: serializeBeaconBody(body), startTime: now(), type: 'beacon',
+      });
+      return originalSendBeacon(url, body);
+    };
+  }
 
   // ============ XMLHttpRequest ============
   const XHR = XMLHttpRequest.prototype;
@@ -428,10 +534,18 @@
         if (delay) {
           nc.mockTimer = setTimeout(() => {
             nc.mockTimer = null;
-            if (!nc.aborted) completeMockXhr(xhr, nc, registration.mockResponse);
+            if (!nc.aborted) {
+              if (registration.mockResponse.error) {
+                xhr.dispatchEvent(new Event('error'));
+                cleanupXhrCapture(xhr, nc);
+              } else completeMockXhr(xhr, nc, registration.mockResponse);
+            }
           }, delay);
         }
-        else completeMockXhr(xhr, nc, registration.mockResponse);
+        else if (registration.mockResponse.error) {
+          xhr.dispatchEvent(new Event('error'));
+          cleanupXhrCapture(xhr, nc);
+        } else completeMockXhr(xhr, nc, registration.mockResponse);
       } else {
         originalSend.apply(xhr, [body]);
       }
@@ -446,6 +560,7 @@
     const wsUrl = String(url);
     const wsId = createCaptureId('ws');
     const ws = protocols !== undefined ? new OriginalWebSocket(url, protocols) : new OriginalWebSocket(url);
+    wsInstances.set(wsId, ws);
 
     sendToBridge('WS_OPEN', { id: wsId, url: wsUrl, startTime, protocols: protocols || null });
     ws.addEventListener('open', () => {
@@ -454,44 +569,12 @@
 
     const originalWsSend = ws.send.bind(ws);
     ws.send = function(data) {
-      let messageData;
-      let messageType = 'text';
-      if (typeof data === 'string') messageData = data;
-      else if (data instanceof ArrayBuffer) {
-        messageData = `[ArrayBuffer ${data.byteLength} bytes]`;
-        messageType = 'binary';
-      } else if (data instanceof Blob) {
-        messageData = `[Blob ${data.size} bytes]`;
-        messageType = 'binary';
-      } else if (ArrayBuffer.isView(data)) {
-        messageData = `[ArrayBufferView ${data.byteLength} bytes]`;
-        messageType = 'binary';
-      } else {
-        try { messageData = String(data); } catch { messageData = '[Unknown data]'; }
-      }
-      sendToBridge('WS_MESSAGE', {
-        id: wsId, direction: 'send', messageType, data: messageData, timestamp: now(),
-      });
+      captureWebSocketMessage(wsId, 'send', data);
       return originalWsSend(data);
     };
 
     ws.addEventListener('message', event => {
-      let data;
-      let messageType = 'text';
-      if (typeof event.data === 'string') data = event.data;
-      else if (event.data instanceof ArrayBuffer) {
-        data = `[ArrayBuffer ${event.data.byteLength} bytes]`;
-        messageType = 'binary';
-      } else if (event.data instanceof Blob) {
-        data = `[Blob ${event.data.size} bytes]`;
-        messageType = 'binary';
-      } else {
-        data = '[binary data]';
-        messageType = 'binary';
-      }
-      sendToBridge('WS_MESSAGE', {
-        id: wsId, direction: 'receive', messageType, data, timestamp: now(),
-      });
+      captureWebSocketMessage(wsId, 'receive', event.data);
     });
 
     ws.addEventListener('close', event => {
@@ -499,6 +582,7 @@
         id: wsId, code: event.code, reason: event.reason,
         wasClean: event.wasClean, timestamp: now(),
       });
+      wsInstances.delete(wsId);
     });
     ws.addEventListener('error', () => {
       sendToBridge('WS_ERROR', { id: wsId, timestamp: now() });

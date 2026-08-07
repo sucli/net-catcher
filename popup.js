@@ -16,6 +16,9 @@ let captureScope = 'current';
 let captureSettings = { redactSensitive: true, excludedHosts: [] };
 let replayDefaults = null;
 let lastStorageError = '';
+let sessions = [];
+let activeSessionId = '';
+let scenarios = [];
 
 // 初始化
 document.addEventListener('DOMContentLoaded', () => {
@@ -44,6 +47,11 @@ function loadRequests() {
       allWsConnections = res.wsConnections || [];
       mockRules = res.mockRules || [];
       isCapturing = res.isCapturing;
+      sessions = res.sessions || [];
+      activeSessionId = res.activeSessionId || '';
+      scenarios = res.scenarios || [];
+      renderSessions();
+      renderScenarios();
       if (res.storageError && res.storageError !== lastStorageError) {
         lastStorageError = res.storageError;
         showToast(`存储失败: ${res.storageError}`);
@@ -65,6 +73,22 @@ function loadSettings() {
     document.getElementById('chk-redact').checked = captureSettings.redactSensitive !== false;
     document.getElementById('excluded-hosts').value = (captureSettings.excludedHosts || []).join(', ');
   });
+}
+
+function renderSessions() {
+  const select = document.getElementById('session-select');
+  if (!select) return;
+  select.innerHTML = '<option value="">会话...</option>' + sessions.map(session =>
+    `<option value="${escapeHtml(session.id)}" ${session.id === activeSessionId ? 'selected' : ''}>${escapeHtml(session.name)}</option>`
+  ).join('');
+}
+
+function renderScenarios() {
+  const select = document.getElementById('scenario-select');
+  if (!select) return;
+  select.innerHTML = '<option value="">测试场景...</option>' + scenarios.map(scenario =>
+    `<option value="${scenario.id}">${escapeHtml(scenario.name)} (${scenario.steps.length})</option>`
+  ).join('');
 }
 
 function saveSettings() {
@@ -124,6 +148,63 @@ function bindEvents() {
   document.getElementById('chk-redact').addEventListener('change', saveSettings);
   document.getElementById('excluded-hosts').addEventListener('change', saveSettings);
 
+  document.getElementById('session-select').addEventListener('change', event => {
+    const id = event.target.value;
+    if (!id || id === activeSessionId) return;
+    chrome.runtime.sendMessage({ type: 'SWITCH_SESSION', data: { id } }, res => {
+      if (res?.error) { showToast(res.error); return; }
+      loadRequests();
+    });
+  });
+  document.getElementById('btn-new-session').addEventListener('click', () => {
+    const name = window.prompt('会话名称', `会话 ${sessions.length + 1}`);
+    if (name === null) return;
+    chrome.runtime.sendMessage({ type: 'CREATE_SESSION', data: { name } }, res => {
+      if (res?.error) { showToast(res.error); return; }
+      loadRequests();
+      showToast('会话已创建');
+    });
+  });
+  document.getElementById('btn-delete-session').addEventListener('click', () => {
+    if (!activeSessionId || !window.confirm('删除当前会话及其抓包记录？')) return;
+    chrome.runtime.sendMessage({ type: 'DELETE_SESSION', data: { id: activeSessionId } }, res => {
+      if (res?.error) { showToast(res.error); return; }
+      loadRequests();
+      showToast('会话已删除');
+    });
+  });
+  document.getElementById('btn-save-scenario').addEventListener('click', () => {
+    const ids = Array.from(selectedIds);
+    if (!ids.length) { showToast('请先选择请求'); return; }
+    const name = window.prompt('测试场景名称', `场景 ${scenarios.length + 1}`);
+    if (!name) return;
+    chrome.runtime.sendMessage({ type: 'SAVE_SCENARIO', data: { name, ids } }, res => {
+      if (res?.error) { showToast(res.error); return; }
+      scenarios = res.scenarios || scenarios;
+      renderScenarios();
+      showToast('测试场景已保存');
+    });
+  });
+  document.getElementById('btn-run-scenario').addEventListener('click', () => {
+    const id = Number(document.getElementById('scenario-select').value);
+    if (!id) { showToast('请选择测试场景'); return; }
+    chrome.runtime.sendMessage({ type: 'RUN_SCENARIO', data: { id } }, res => {
+      if (res?.error) { showToast(res.error); return; }
+      const results = res?.results || [];
+      const passed = results.filter(item => item.passed).length;
+      showToast(`场景完成：${passed}/${results.length} 通过`);
+    });
+  });
+  document.getElementById('btn-delete-scenario').addEventListener('click', () => {
+    const id = Number(document.getElementById('scenario-select').value);
+    if (!id) return;
+    chrome.runtime.sendMessage({ type: 'DELETE_SCENARIO', data: { id } }, res => {
+      scenarios = res?.scenarios || scenarios.filter(item => item.id !== id);
+      renderScenarios();
+      showToast('测试场景已删除');
+    });
+  });
+
   document.getElementById('btn-toggle').addEventListener('click', () => {
     chrome.runtime.sendMessage({ type: 'TOGGLE_CAPTURE' }, (res) => {
       if (res) { isCapturing = res.isCapturing; updateToggleButton(); }
@@ -151,6 +232,64 @@ function bindEvents() {
           `netcatcher-${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.har`);
         showToast('HAR 文件已导出');
       }
+    });
+  });
+  document.getElementById('btn-export-openapi').addEventListener('click', () => {
+    const data = captureScope === 'current' && Number.isInteger(activeTabId) ? { tabId: activeTabId } : {};
+    chrome.runtime.sendMessage({ type: 'EXPORT_OPENAPI', data }, res => {
+      if (!res?.openapi) return;
+      downloadFile(JSON.stringify(res.openapi, null, 2), 'application/json',
+        `netcatcher-openapi-${new Date().toISOString().slice(0, 10)}.json`);
+      showToast('OpenAPI 已导出');
+    });
+  });
+
+  document.getElementById('btn-import-har').addEventListener('click', () => {
+    document.getElementById('har-file-input').click();
+  });
+  document.getElementById('har-file-input').addEventListener('change', async event => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    try {
+      const har = JSON.parse(await file.text());
+      chrome.runtime.sendMessage({ type: 'IMPORT_HAR', data: { har, tabId: activeTabId } }, res => {
+        if (res?.error) { showToast(res.error); return; }
+        loadRequests();
+        showToast(`已导入 ${res?.count || 0} 条请求`);
+      });
+    } catch {
+      showToast('HAR 文件格式无效');
+    }
+  });
+  document.getElementById('btn-import-curl').addEventListener('click', () => {
+    const value = window.prompt('粘贴 cURL 命令');
+    if (!value) return;
+    const request = parseCurl(value);
+    if (!request) { showToast('无法解析 cURL'); return; }
+    chrome.runtime.sendMessage({ type: 'IMPORT_REQUESTS', data: { requests: [request], tabId: activeTabId } }, res => {
+      if (res?.error) { showToast(res.error); return; }
+      loadRequests();
+      showToast('cURL 已导入');
+    });
+  });
+  document.getElementById('btn-batch-replay').addEventListener('click', () => {
+    const ids = Array.from(selectedIds);
+    if (!ids.length) { showToast('请先选择请求'); return; }
+    chrome.runtime.sendMessage({ type: 'REPLAY_BATCH', data: { ids } }, res => {
+      if (res?.error) { showToast(res.error); return; }
+      const failed = (res?.results || []).filter(item => item.error).length;
+      showToast(`批量重放完成，成功 ${(res?.results || []).length - failed}，失败 ${failed}`);
+    });
+  });
+  document.getElementById('btn-open-sidepanel').addEventListener('click', () => {
+    chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+      const windowId = tabs?.[0]?.windowId;
+      if (!Number.isInteger(windowId) || !chrome.sidePanel?.open) {
+        showToast('当前 Chrome 不支持侧边栏');
+        return;
+      }
+      chrome.sidePanel.open({ windowId }).catch(() => showToast('无法打开侧边栏'));
     });
   });
 
@@ -236,6 +375,25 @@ function bindEvents() {
 
   // 重放
   document.getElementById('btn-replay').addEventListener('click', replayRequest);
+  document.getElementById('btn-save-assertion').addEventListener('click', () => {
+    const id = Array.from(selectedIds)[0];
+    if (!id) return;
+    const jsonChecks = document.getElementById('assert-json').value.split('\n').map(line => line.trim()).filter(Boolean)
+      .map(line => {
+        const index = line.indexOf('=');
+        return index > 0 ? { path: line.slice(0, index).trim(), expected: line.slice(index + 1).trim() } : null;
+      }).filter(Boolean);
+    chrome.runtime.sendMessage({ type: 'UPDATE_ASSERTIONS', data: {
+      id,
+      assertions: {
+        status: document.getElementById('assert-status').value,
+        maxDurationMs: document.getElementById('assert-duration').value,
+        jsonChecks,
+      },
+    } }, res => {
+      if (res?.ok) showToast('断言已保存');
+    });
+  });
 
   // 收藏
   document.getElementById('btn-star').addEventListener('click', () => {
@@ -257,6 +415,15 @@ function bindEvents() {
 
   // 导出 WS
   document.getElementById('btn-ws-export').addEventListener('click', exportWsMessages);
+  document.getElementById('btn-ws-send').addEventListener('click', () => {
+    const data = document.getElementById('ws-send-input').value;
+    if (!selectedWsId || !data) return;
+    chrome.runtime.sendMessage({ type: 'REPLAY_WS', data: { id: selectedWsId, data } }, res => {
+      if (res?.error) { showToast(res.error); return; }
+      document.getElementById('ws-send-input').value = '';
+      showToast('WebSocket 消息已发送');
+    });
+  });
   document.getElementById('ws-filter').addEventListener('input', () => {
     renderWsConnections();
     if (selectedWsId) showWsDetail(selectedWsId);
@@ -647,7 +814,7 @@ function renderMockRules() {
       </div>
       <div class="mock-item-detail">
         <span class="mock-pattern">${rule.isRegex ? '🔤' : '📝'} ${escapeHtml(rule.method || '*')} ${escapeHtml(rule.pattern)}</span>
-        <span class="mock-status">${rule.status}</span>
+        <span class="mock-status">${rule.action === 'error' ? '错误' : rule.status} · P${rule.priority || 0}</span>
       </div>
     </div>
   `).join('');
@@ -681,6 +848,12 @@ function openMockEditor(rule) {
   document.getElementById('mock-pattern').value = rule?.pattern || '';
   document.getElementById('mock-is-regex').checked = rule?.isRegex || false;
   document.getElementById('mock-method').value = rule?.method || '*';
+  document.getElementById('mock-priority').value = rule?.priority || 0;
+  document.getElementById('mock-action').value = rule?.action || 'respond';
+  document.getElementById('mock-error').value = rule?.error || 'Mock Network Error';
+  document.getElementById('mock-match-query').value = JSON.stringify(rule?.matchQuery || {});
+  document.getElementById('mock-match-headers').value = JSON.stringify(rule?.matchHeaders || {});
+  document.getElementById('mock-match-body').value = rule?.matchBody || '';
   document.getElementById('mock-delay').value = rule?.delay || 0;
   document.getElementById('mock-status').value = rule?.status || 200;
   document.getElementById('mock-headers').value = JSON.stringify(rule?.headers || { 'content-type': 'application/json' });
@@ -695,12 +868,22 @@ function saveMockRule() {
 
   let headers = {};
   try { headers = JSON.parse(document.getElementById('mock-headers').value); } catch {}
+  let matchQuery = {};
+  let matchHeaders = {};
+  try { matchQuery = JSON.parse(document.getElementById('mock-match-query').value || '{}'); } catch {}
+  try { matchHeaders = JSON.parse(document.getElementById('mock-match-headers').value || '{}'); } catch {}
 
   const data = {
     name: document.getElementById('mock-name').value.trim(),
     pattern,
     isRegex: document.getElementById('mock-is-regex').checked,
     method: document.getElementById('mock-method').value,
+    priority: parseInt(document.getElementById('mock-priority').value, 10) || 0,
+    action: document.getElementById('mock-action').value,
+    error: document.getElementById('mock-error').value.trim(),
+    matchQuery,
+    matchHeaders,
+    matchBody: document.getElementById('mock-match-body').value,
     delay: Math.max(0, parseInt(document.getElementById('mock-delay').value, 10) || 0),
     status: parseInt(document.getElementById('mock-status').value) || 200,
     headers,
@@ -743,6 +926,12 @@ function showDetail(id) {
     <tr><td>耗时</td><td>${r.duration ? Math.round(r.duration) + 'ms' : '---'}</td></tr>
     <tr><td>大小</td><td>${r.size ? formatSize(r.size) : '---'}</td></tr>
   </table>`;
+  if (r.graphql) {
+    headersHtml += `<div class="header-section-title">GraphQL</div><table class="header-table">
+      <tr><td>操作名</td><td>${escapeHtml(r.graphql.operationName || '匿名操作')}</td></tr>
+      <tr><td>Query</td><td><pre class="graphql-query">${escapeHtml(r.graphql.query)}</pre></td></tr>
+    </table>`;
+  }
 
   const reqHeaders = r.requestHeaders || {};
   if (Object.keys(reqHeaders).length > 0) {
@@ -775,6 +964,11 @@ function showDetail(id) {
     const tags = event.target.value.split(',').map(tag => tag.trim()).filter(Boolean);
     chrome.runtime.sendMessage({ type: 'UPDATE_TAGS', data: { id: r.id, tags } });
   };
+  const assertions = r.assertions || {};
+  document.getElementById('assert-status').value = assertions.status ?? '';
+  document.getElementById('assert-duration').value = assertions.maxDurationMs ?? '';
+  document.getElementById('assert-json').value = (assertions.jsonChecks || [])
+    .map(check => `${check.path}=${check.expected}`).join('\n');
   document.getElementById('btn-star').textContent = r.starred ? '⭐ 已收藏' : '⭐';
 
   const replayMethod = document.getElementById('replay-method');
@@ -810,7 +1004,7 @@ function renderPreview(r) {
 
   // JSON 预览
   if (contentType.includes('json') || r.responseBody.trim().startsWith('{') || r.responseBody.trim().startsWith('[')) {
-    preview.innerHTML = `<div class="preview-json"><div class="body-content">${formatBody(r.responseBody)}</div></div>`;
+    preview.innerHTML = `<div class="preview-json"><div class="json-tree">${formatJsonTree(r.responseBody)}</div><div class="body-content">${formatBody(r.responseBody)}</div></div>`;
     return;
   }
 
@@ -903,7 +1097,12 @@ function showWsDetail(id) {
     messages.map(msg => {
       const dirClass = msg.direction === 'send' ? 'ws-msg-send' : 'ws-msg-receive';
       let data = msg.data;
-      try { data = JSON.stringify(JSON.parse(msg.data), null, 2); } catch {}
+      if (msg.encoding === 'base64') {
+        data = `[Base64 ${msg.size || '?'} bytes]\n${msg.data}`;
+        if (msg.hex) data += `\n\nHex: ${msg.hex}`;
+      } else {
+        try { data = JSON.stringify(JSON.parse(msg.data), null, 2); } catch {}
+      }
       return `<div class="ws-message ${dirClass}">
         <div class="ws-msg-header">
           <span class="ws-msg-dir">${msg.direction === 'send' ? '↑ 发送' : '↓ 接收'}</span>
@@ -933,6 +1132,7 @@ function exportWsMessages() {
     endTime: conn.endTime ? new Date(conn.endTime).toISOString() : null,
     messages: conn.messages.map(m => ({
       direction: m.direction, type: m.type, data: m.data,
+      encoding: m.encoding || null, size: m.size || null, hex: m.hex || null,
       time: new Date(m.timestamp).toISOString(),
     })),
   }, null, 2), 'application/json', `ws-${Date.now()}.json`);
@@ -1024,6 +1224,49 @@ function generateCurl(r) {
   return parts.join(' \\\n  ');
 }
 
+function parseCurl(command) {
+  const tokens = [];
+  String(command).replace(/(?:[^\s"']+|"(?:\\.|[^"])*"|'[^']*')+/g, token => {
+    let value = token;
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    tokens.push(value.replace(/\\([\\"'])/g, '$1'));
+    return token;
+  });
+  let url = '';
+  let method = '';
+  let body = null;
+  const headers = {};
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (token === 'curl') continue;
+    if (token === '-X' || token === '--request') { method = tokens[++i] || ''; continue; }
+    if (token === '-H' || token === '--header') {
+      const header = tokens[++i] || '';
+      const index = header.indexOf(':');
+      if (index > 0) headers[header.slice(0, index).trim()] = header.slice(index + 1).trim();
+      continue;
+    }
+    if (['-d', '--data', '--data-raw', '--data-binary', '--data-urlencode'].includes(token)) {
+      body = tokens[++i] || '';
+      if (!method) method = 'POST';
+      continue;
+    }
+    if (token === '--url') { url = tokens[++i] || ''; continue; }
+    if (/^https?:\/\//i.test(token) || /^wss?:\/\//i.test(token)) url = token;
+  }
+  if (!url) return null;
+  return {
+    url,
+    method: (method || (body === null ? 'GET' : 'POST')).toUpperCase(),
+    requestHeaders: headers,
+    requestBody: body,
+    startTime: Date.now(),
+    type: 'curl',
+  };
+}
+
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
@@ -1032,6 +1275,23 @@ function formatBody(body) {
   if (!body) return '<span class="no-data">无数据</span>';
   try { return syntaxHighlight(JSON.stringify(JSON.parse(body), null, 2)); }
   catch { return escapeHtml(body); }
+}
+
+function formatJsonTree(body) {
+  let value;
+  try { value = JSON.parse(body); } catch { return ''; }
+  const render = (item, key, depth) => {
+    const label = key === null ? '' : `<span class="json-tree-key">${escapeHtml(String(key))}</span>: `;
+    if (item === null || typeof item !== 'object') {
+      return `<div class="json-tree-row" style="--depth:${Math.min(depth, 8)}"><span>${label}${escapeHtml(JSON.stringify(item))}</span></div>`;
+    }
+    const entries = Object.entries(item);
+    return `<details class="json-tree-node" ${depth < 2 ? 'open' : ''} style="--depth:${Math.min(depth, 8)}">
+      <summary>${label}${Array.isArray(item) ? `[${entries.length}]` : `{${entries.length}}`}</summary>
+      ${entries.map(([childKey, child]) => render(child, childKey, depth + 1)).join('')}
+    </details>`;
+  };
+  return render(value, null, 0);
 }
 
 function syntaxHighlight(json) {

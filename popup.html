@@ -23,6 +23,17 @@
         <option value="">过滤器...</option>
       </select>
       <button id="btn-delete-filter" class="btn btn-small" title="删除选中的过滤器">✕</button>
+      <select id="session-select" class="filter-select" title="抓包会话">
+        <option value="">会话...</option>
+      </select>
+      <button id="btn-new-session" class="btn btn-small" title="新建会话">＋</button>
+      <button id="btn-delete-session" class="btn btn-small btn-red" title="删除当前会话">🗑</button>
+      <select id="scenario-select" class="filter-select" title="测试场景">
+        <option value="">测试场景...</option>
+      </select>
+      <button id="btn-save-scenario" class="btn btn-small" title="保存选中请求为场景">场景＋</button>
+      <button id="btn-run-scenario" class="btn btn-small btn-green" title="运行测试场景">测试▶</button>
+      <button id="btn-delete-scenario" class="btn btn-small btn-red" title="删除测试场景">场景×</button>
       <select id="capture-scope" class="filter-select" title="请求范围">
         <option value="current">当前标签页</option>
         <option value="all">全部标签页</option>
@@ -31,6 +42,12 @@
       <button id="btn-toggle" class="btn btn-green" title="暂停/恢复">⏸</button>
       <button id="btn-clear" class="btn btn-red" title="清除记录">🗑</button>
       <button id="btn-export" class="btn btn-blue" title="导出 HAR">📥</button>
+      <button id="btn-export-openapi" class="btn btn-blue" title="导出 OpenAPI">API↓</button>
+      <button id="btn-import-har" class="btn btn-blue" title="导入 HAR">📤</button>
+      <button id="btn-import-curl" class="btn btn-blue" title="导入 cURL">cURL↑</button>
+      <button id="btn-batch-replay" class="btn btn-green" title="批量重放已选请求">▶▶</button>
+      <button id="btn-open-sidepanel" class="btn btn-small" title="在侧边栏打开">◧</button>
+      <input id="har-file-input" type="file" accept=".har,.json" hidden>
       <label class="auto-scroll-toggle" title="自动滚动到最新请求">
         <input type="checkbox" id="chk-auto-scroll" checked>
         <span>滚动</span>
@@ -78,6 +95,9 @@
       <option value="">全部类型</option>
       <option value="fetch">Fetch</option>
       <option value="xhr">XHR</option>
+      <option value="eventsource">EventSource</option>
+      <option value="beacon">Beacon</option>
+      <option value="network">网络层</option>
     </select>
     <select id="filter-sort" class="filter-select">
       <option value="time-desc">时间 ↓</option>
@@ -140,6 +160,13 @@
         </div>
       </div>
       <div class="detail-tags"><label for="detail-tags">标签</label><input id="detail-tags" class="form-input" placeholder="逗号分隔"></div>
+      <div class="assertion-editor">
+        <label>断言</label>
+        <input id="assert-status" class="form-input form-input-small" type="number" placeholder="状态码">
+        <input id="assert-duration" class="form-input form-input-small" type="number" min="0" placeholder="最大耗时 ms">
+        <textarea id="assert-json" class="form-textarea" placeholder="JSON 断言，每行一个，例如 $.code=0"></textarea>
+        <button id="btn-save-assertion" class="btn btn-small">保存断言</button>
+      </div>
       <div class="detail-tabs">
         <button class="tab active" data-tab="tab-headers">Headers</button>
         <button class="tab" data-tab="tab-request">请求体</button>
@@ -188,6 +215,10 @@
         </div>
       </div>
       <div class="ws-info" id="ws-info"></div>
+      <div class="ws-replay-bar">
+        <input id="ws-send-input" class="form-input" placeholder="发送 WebSocket 消息">
+        <button id="btn-ws-send" class="btn btn-green">发送</button>
+      </div>
       <div class="ws-messages-container">
         <div class="ws-messages" id="ws-messages"></div>
       </div>
@@ -229,6 +260,33 @@
             <option>GET</option><option>POST</option><option>PUT</option>
             <option>PATCH</option><option>DELETE</option><option>OPTIONS</option>
           </select>
+        </div>
+        <div class="form-row">
+          <label>优先级</label>
+          <input type="number" id="mock-priority" value="0" class="form-input form-input-small">
+        </div>
+        <div class="form-row">
+          <label>动作</label>
+          <select id="mock-action" class="form-input form-input-small">
+            <option value="respond">返回响应</option>
+            <option value="error">模拟网络错误</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>错误信息</label>
+          <input type="text" id="mock-error" value="Mock Network Error" class="form-input">
+        </div>
+        <div class="form-row">
+          <label>Query 匹配 (JSON)</label>
+          <input type="text" id="mock-match-query" value="{}" class="form-input">
+        </div>
+        <div class="form-row">
+          <label>请求头匹配 (JSON)</label>
+          <input type="text" id="mock-match-headers" value="{}" class="form-input">
+        </div>
+        <div class="form-row">
+          <label>请求体包含</label>
+          <input type="text" id="mock-match-body" class="form-input">
         </div>
         <div class="form-row">
           <label>响应延迟 (ms)</label>
