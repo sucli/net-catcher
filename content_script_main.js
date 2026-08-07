@@ -9,6 +9,21 @@
   const pendingBridgeRequests = new Map();
   let fallbackId = 0;
   let mockDecisionRequired = true;
+  let bridgeNonce = null;
+  let bridgeNoncePromise = null;
+  let bridgeNonceResolve = null;
+
+  function waitForBridgeNonce() {
+    if (bridgeNonce) return Promise.resolve(bridgeNonce);
+    if (!bridgeNoncePromise) {
+      bridgeNoncePromise = new Promise(resolve => { bridgeNonceResolve = resolve; });
+      window.postMessage({ __netCatcher: true, __netCatcherHello: true }, '*');
+    }
+    return Promise.race([
+      bridgeNoncePromise,
+      new Promise(resolve => setTimeout(() => resolve(null), BRIDGE_TIMEOUT_MS)),
+    ]);
+  }
 
   function now() {
     return performance.timeOrigin + performance.now();
@@ -21,7 +36,13 @@
   }
 
   function sendToBridge(type, data) {
-    window.postMessage({ __netCatcher: true, type, data }, '*');
+    if (bridgeNonce) {
+      window.postMessage({ __netCatcher: true, type, data, nonce: bridgeNonce }, '*');
+      return;
+    }
+    waitForBridgeNonce().then(nonce => {
+      if (nonce) window.postMessage({ __netCatcher: true, type, data, nonce }, '*');
+    });
   }
 
   function requestBridge(type, data) {
@@ -36,22 +57,38 @@
         clearTimeout(timer);
         resolve(response);
       });
-      window.postMessage({ __netCatcher: true, messageId, type, data }, '*');
+      waitForBridgeNonce().then(nonce => {
+        if (!nonce) {
+          pendingBridgeRequests.delete(messageId);
+          clearTimeout(timer);
+          resolve(null);
+          return;
+        }
+        window.postMessage({ __netCatcher: true, messageId, type, data, nonce }, '*');
+      });
     });
   }
 
   window.addEventListener('message', event => {
     if (event.source !== window) return;
+    if (event.data?.__netCatcherBridgeReady && typeof event.data.nonce === 'string') {
+      bridgeNonce = event.data.nonce;
+      if (bridgeNonceResolve) bridgeNonceResolve(bridgeNonce);
+      return;
+    }
     if (event.data?.__netCatcherConfig) {
+      if (event.data.nonce !== bridgeNonce) return;
       mockDecisionRequired = !!event.data.hasActiveMockRules;
       return;
     }
     if (!event.data?.__netCatcherResponse) return;
+    if (event.data.nonce !== bridgeNonce) return;
     const resolve = pendingBridgeRequests.get(event.data.messageId);
     if (!resolve) return;
     pendingBridgeRequests.delete(event.data.messageId);
     resolve(event.data.response ?? null);
   });
+  window.postMessage({ __netCatcher: true, __netCatcherHello: true }, '*');
 
   function normalizeHeaders(headers) {
     const result = {};
@@ -62,7 +99,46 @@
     return result;
   }
 
+  async function serializeRequestBody(body) {
+    if (body === undefined || body === null) return null;
+    if (typeof body === 'string') return body;
+    if (body instanceof FormData) return '[FormData]';
+    if (body instanceof URLSearchParams) return body.toString();
+    if (body instanceof Blob) {
+      try { return await body.text(); } catch { return `[Blob ${body.size} bytes]`; }
+    }
+    if (body instanceof ArrayBuffer) {
+      try { return new TextDecoder().decode(body); } catch { return `[ArrayBuffer ${body.byteLength} bytes]`; }
+    }
+    try { return JSON.stringify(body); } catch { return null; }
+  }
+
+  function bytesToBase64(buffer) {
+    if (typeof btoa !== 'function') return null;
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+    }
+    return btoa(binary);
+  }
+
   async function readResponseBody(response) {
+    const contentType = response.headers?.get?.('content-type') || '';
+    if (contentType.toLowerCase().startsWith('image/') && typeof response.arrayBuffer === 'function') {
+      try {
+        const buffer = await response.arrayBuffer();
+        const body = bytesToBase64(buffer);
+        return {
+          body: buffer.byteLength <= MAX_CAPTURE_BODY_BYTES ? body : null,
+          bodyEncoding: body && buffer.byteLength <= MAX_CAPTURE_BODY_BYTES ? 'base64' : undefined,
+          bodyMimeType: contentType.split(';', 1)[0],
+          size: buffer.byteLength,
+          truncated: buffer.byteLength > MAX_CAPTURE_BODY_BYTES,
+        };
+      } catch {}
+    }
     if (!response.body?.getReader) {
       const text = await response.text();
       return {
@@ -125,12 +201,9 @@
     const captureId = createCaptureId('http');
     const startTime = now();
 
-    let requestBody = null;
-    if (init.body) {
-      if (typeof init.body === 'string') requestBody = init.body;
-      else if (init.body instanceof FormData) requestBody = '[FormData]';
-      else if (init.body instanceof URLSearchParams) requestBody = init.body.toString();
-      else try { requestBody = JSON.stringify(init.body); } catch {}
+    let requestBody = await serializeRequestBody(init.body);
+    if (init.body === undefined && input instanceof Request && !['GET', 'HEAD'].includes(method)) {
+      try { requestBody = await input.clone().text(); } catch {}
     }
 
     const requestData = {
@@ -176,15 +249,39 @@
   const originalAbort = XHR.abort;
   const originalSetRequestHeader = XHR.setRequestHeader;
 
+  function cleanupXhrCapture(xhr, nc) {
+    (nc.listenerRefs || []).forEach(({ type, listener }) => {
+      xhr.removeEventListener(type, listener);
+    });
+    nc.listenerRefs = [];
+  }
+
+  function resetMockXhr(xhr, nc) {
+    (nc.mockProperties || []).forEach(name => { delete xhr[name]; });
+    (nc.mockMethods || []).forEach(name => { delete xhr[name]; });
+    nc.mockProperties = [];
+    nc.mockMethods = [];
+  }
+
   XHR.open = function(method, url, ...rest) {
+    const previous = this._netCatcher;
+    if (previous) resetMockXhr(this, previous);
     this._netCatcher = {
       method: String(method).toUpperCase(),
       url: (() => { try { return new URL(String(url), window.location?.href).href; } catch { return String(url); } })(),
       requestHeaders: {},
       async: rest.length === 0 || rest[0] !== false,
       aborted: false,
+      listenerRefs: [],
+      mockTimer: null,
+      mockProperties: [],
+      mockMethods: [],
     };
-    return originalOpen.apply(this, [method, url, ...rest]);
+    try {
+      return originalOpen.apply(this, [method, url, ...rest]);
+    } finally {
+      if (previous) cleanupXhrCapture(this, previous);
+    }
   };
 
   XHR.setRequestHeader = function(name, value) {
@@ -193,7 +290,13 @@
   };
 
   XHR.abort = function() {
-    if (this._netCatcher) this._netCatcher.aborted = true;
+    if (this._netCatcher) {
+      this._netCatcher.aborted = true;
+      if (this._netCatcher.mockTimer) {
+        clearTimeout(this._netCatcher.mockTimer);
+        this._netCatcher.mockTimer = null;
+      }
+    }
     return originalAbort.apply(this);
   };
 
@@ -223,12 +326,16 @@
       responseXML: () => null,
     };
     Object.entries(values).forEach(([name, get]) => {
-      try { Object.defineProperty(xhr, name, { configurable: true, get }); } catch {}
+      try {
+        Object.defineProperty(xhr, name, { configurable: true, get });
+        nc.mockProperties.push(name);
+      } catch {}
     });
 
     xhr.getResponseHeader = name => headers[String(name).toLowerCase()] ?? null;
     xhr.getAllResponseHeaders = () => Object.entries(headers)
       .map(([name, value]) => `${name}: ${value}\r\n`).join('');
+    nc.mockMethods.push('getResponseHeader', 'getAllResponseHeaders');
 
     const total = new TextEncoder().encode(body).byteLength;
     xhr.dispatchEvent(new ProgressEvent('loadstart', { lengthComputable: true, loaded: 0, total }));
@@ -239,6 +346,7 @@
     xhr.dispatchEvent(new ProgressEvent('progress', { lengthComputable: true, loaded: total, total }));
     xhr.dispatchEvent(new ProgressEvent('load', { lengthComputable: true, loaded: total, total }));
     xhr.dispatchEvent(new ProgressEvent('loadend', { lengthComputable: true, loaded: total, total }));
+    cleanupXhrCapture(xhr, nc);
   }
 
   XHR.send = function(body) {
@@ -246,17 +354,19 @@
 
     const xhr = this;
     const nc = this._netCatcher;
+    cleanupXhrCapture(this, nc);
+    nc.listenerRefs = [];
     nc.captureId = createCaptureId('http');
     nc.startTime = now();
     nc.requestBody = null;
-    if (body) {
+    if (body !== undefined && body !== null) {
       if (typeof body === 'string') nc.requestBody = body;
       else if (body instanceof FormData) nc.requestBody = '[FormData]';
       else if (body instanceof URLSearchParams) nc.requestBody = body.toString();
       else try { nc.requestBody = JSON.stringify(body); } catch {}
     }
 
-    this.addEventListener('load', function() {
+    const loadListener = function() {
       if (nc.mocked) return;
       const responseHeaders = {};
       const headerString = this.getAllResponseHeaders();
@@ -275,17 +385,24 @@
         responseHeaders, responseBody, endTime: now(),
         size: responseBody ? responseBody.length : 0,
       });
-    });
+      cleanupXhrCapture(xhr, nc);
+    };
 
-    this.addEventListener('error', function() {
+    const errorListener = function() {
       if (!nc.mocked) sendToBridge('NET_ERROR', {
         captureId: nc.captureId, url: nc.url, error: 'Network Error', endTime: now(),
       });
-    });
-    this.addEventListener('abort', function() {
+      cleanupXhrCapture(xhr, nc);
+    };
+    const abortListener = function() {
       if (!nc.mocked) sendToBridge('NET_ERROR', {
         captureId: nc.captureId, url: nc.url, error: 'Aborted', endTime: now(),
       });
+      cleanupXhrCapture(xhr, nc);
+    };
+    [['load', loadListener], ['error', errorListener], ['abort', abortListener]].forEach(([type, listener]) => {
+      this.addEventListener(type, listener);
+      nc.listenerRefs.push({ type, listener });
     });
 
     const requestData = {
@@ -308,7 +425,12 @@
       if (nc.aborted) return;
       if (registration?.mocked && registration.mockResponse) {
         const delay = Math.max(0, Number(registration.mockResponse.delay) || 0);
-        if (delay) setTimeout(() => completeMockXhr(xhr, nc, registration.mockResponse), delay);
+        if (delay) {
+          nc.mockTimer = setTimeout(() => {
+            nc.mockTimer = null;
+            if (!nc.aborted) completeMockXhr(xhr, nc, registration.mockResponse);
+          }, delay);
+        }
         else completeMockXhr(xhr, nc, registration.mockResponse);
       } else {
         originalSend.apply(xhr, [body]);

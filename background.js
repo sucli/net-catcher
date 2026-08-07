@@ -7,9 +7,12 @@ const MAX_WS_MESSAGES = 200;
 const MAX_WS_MESSAGE_CHARS = 4096;
 const MAX_PERSISTED_WS_MESSAGES = 20;
 const MAX_PERSISTED_BODY_BYTES = 4 * 1024 * 1024;
+const MAX_CAPTURE_URL_LENGTH = 8192;
+const MAX_CAPTURE_HEADER_CHARS = 64 * 1024;
+const MAX_CAPTURE_BODY_CHARS = 1024 * 1024;
 const DEFAULT_SETTINGS = {
   redactSensitive: true,
-  sensitiveHeaders: ['authorization', 'cookie', 'set-cookie', 'x-api-key'],
+  sensitiveHeaders: ['authorization', 'proxy-authorization', 'cookie', 'set-cookie', 'x-api-key', 'x-auth-token'],
   excludedHosts: [],
 };
 const CAPTURE_TYPES = new Set([
@@ -23,6 +26,8 @@ let requestId = 0;
 let mockRules = [];
 let savedFilters = [];
 let settings = { ...DEFAULT_SETTINGS };
+let storageError = null;
+let persistQueue = Promise.resolve();
 
 // Wait for persisted state before handling events after a service-worker wake-up.
 const initialization = chrome.storage.local.get([
@@ -73,7 +78,7 @@ function persist() {
     return copy;
   }).reverse();
 
-  chrome.storage.local.set({
+  const payload = {
     nc_requests: persistedRequests,
     nc_wsConnections: JSON.stringify(persistedWsArr),
     nc_requestId: requestId,
@@ -81,7 +86,19 @@ function persist() {
     nc_mockRules: mockRules,
     nc_savedFilters: savedFilters,
     nc_settings: settings,
-  });
+  };
+  persistQueue = persistQueue
+    .catch(() => {})
+    .then(() => chrome.storage.local.set(payload))
+    .then(() => { storageError = null; })
+    .catch(handleStorageError);
+}
+
+function handleStorageError(error) {
+  storageError = String(error?.message || error || 'storage write failed');
+  try {
+    Promise.resolve(chrome.runtime.sendMessage({ type: 'STORAGE_ERROR', message: storageError })).catch(() => {});
+  } catch {}
 }
 
 function isExcluded(url) {
@@ -105,20 +122,72 @@ function redactHeaders(headers) {
   ));
 }
 
+function limitHeaders(headers) {
+  if (!headers || typeof headers !== 'object') return {};
+  let used = 0;
+  return Object.fromEntries(Object.entries(headers).flatMap(([name, value]) => {
+    const text = String(value);
+    if (used >= MAX_CAPTURE_HEADER_CHARS) return [];
+    const limited = text.slice(0, MAX_CAPTURE_HEADER_CHARS - used);
+    used += limited.length;
+    return [[String(name).slice(0, 256), limited]];
+  }));
+}
+
 function redactBody(body) {
   if (!settings.redactSensitive || typeof body !== 'string') return body;
-  return body.replace(/("?(?:token|access_token|refresh_token|password|secret|api[_-]?key)"?\s*:\s*)"[^"]*"/gi, '$1"[REDACTED]"');
+  let result = body.replace(/("?(?:token|access_token|refresh_token|password|secret|api[_-]?key)"?\s*:\s*)(["'])[^"']*\2/gi, '$1"[REDACTED]"');
+  return result.replace(/(^|&)([^=&]*(?:token|password|secret|api[_-]?key)[^=&]*)=[^&]*/gi, '$1$2=%5BREDACTED%5D');
+}
+
+function redactUrl(url) {
+  if (!settings.redactSensitive || typeof url !== 'string') return url;
+  try {
+    const parsed = new URL(url);
+    for (const key of Array.from(parsed.searchParams.keys())) {
+      if (/(token|password|secret|api[_-]?key|auth|session)/i.test(key)) {
+        parsed.searchParams.set(key, '[REDACTED]');
+      }
+    }
+    return parsed.href;
+  } catch {
+    return url;
+  }
 }
 
 function sanitizeData(data) {
   return {
     ...data,
-    requestHeaders: redactHeaders(data.requestHeaders),
-    responseHeaders: redactHeaders(data.responseHeaders),
-    requestBody: redactBody(data.requestBody),
-    responseBody: redactBody(data.responseBody),
-    body: redactBody(data.body),
+    url: typeof data.url === 'string' ? redactUrl(data.url).slice(0, MAX_CAPTURE_URL_LENGTH) : data.url,
+    requestHeaders: limitHeaders(redactHeaders(data.requestHeaders)),
+    responseHeaders: limitHeaders(redactHeaders(data.responseHeaders)),
+    requestBody: redactBody(typeof data.requestBody === 'string' ? data.requestBody.slice(0, MAX_CAPTURE_BODY_CHARS) : data.requestBody),
+    responseBody: redactBody(typeof data.responseBody === 'string' ? data.responseBody.slice(0, MAX_CAPTURE_BODY_CHARS) : data.responseBody),
+    body: redactBody(typeof data.body === 'string' ? data.body.slice(0, MAX_CAPTURE_BODY_CHARS) : data.body),
+    data: redactBody(typeof data.data === 'string' ? data.data.slice(0, MAX_CAPTURE_BODY_CHARS) : data.data),
   };
+}
+
+function publicRequest(request) {
+  const { replayHeaders, replayBody, ...safeRequest } = request;
+  return safeRequest;
+}
+
+function byteLength(value) {
+  if (typeof value !== 'string') return 0;
+  try { return new TextEncoder().encode(value).byteLength; }
+  catch { return value.length; }
+}
+
+function replayHeaders(headers) {
+  const forbidden = new Set([
+    'connection', 'content-length', 'cookie', 'host', 'origin', 'referer',
+    'sec-fetch-dest', 'sec-fetch-mode', 'sec-fetch-site', 'user-agent',
+  ]);
+  return Object.fromEntries(Object.entries(headers || {}).filter(([name]) => {
+    const lowerName = String(name).toLowerCase();
+    return !forbidden.has(lowerName) && !lowerName.startsWith('sec-');
+  }));
 }
 
 function isContentScriptSender(sender) {
@@ -201,14 +270,16 @@ function handleMessage(msg, sender, sendResponse) {
 
   if (msg.type === 'NET_REQUEST') {
     if (!isCapturing) { sendResponse(null); return; }
-    if (typeof msg.data.captureId !== 'string' || typeof msg.data.url !== 'string') {
+    if (typeof msg.data.captureId !== 'string' || typeof msg.data.url !== 'string' ||
+      msg.data.captureId.length > 256 || msg.data.url.length > MAX_CAPTURE_URL_LENGTH) {
       sendResponse(null);
       return;
     }
 
     // 检查是否有匹配的 Mock 规则
-    const data = sanitizeData(msg.data);
-    const mockResponse = data.allowMock === false ? null : getMockResponse(data.url, data.method);
+    const rawData = msg.data;
+    const data = sanitizeData(rawData);
+    const mockResponse = rawData.allowMock === false ? null : getMockResponse(rawData.url, rawData.method);
     const rawMethod = String(data.method || 'GET').toUpperCase();
     const method = /^[!#$%&'*+.^_`|~0-9A-Z-]{1,32}$/.test(rawMethod) ? rawMethod : 'UNKNOWN';
 
@@ -234,6 +305,18 @@ function handleMessage(msg, sender, sendResponse) {
       tags: [],
       isMocked: !!mockResponse,
     };
+    Object.defineProperties(entry, {
+      replayHeaders: {
+        value: limitHeaders(rawData.requestHeaders || {}),
+        enumerable: false,
+        configurable: false,
+      },
+      replayBody: {
+        value: typeof rawData.requestBody === 'string' ? rawData.requestBody.slice(0, MAX_CAPTURE_BODY_CHARS) : null,
+        enumerable: false,
+        configurable: false,
+      },
+    });
     requests.push(entry);
     if (requests.length > MAX_REQUESTS) {
       requests = requests.slice(-MAX_REQUESTS);
@@ -279,6 +362,8 @@ function handleMessage(msg, sender, sendResponse) {
     const entry = findCapturedRequest(data, sender);
     if (entry && !entry.isMocked) {
       entry.responseBody = data.body ?? null;
+      entry.bodyEncoding = data.bodyEncoding;
+      entry.bodyMimeType = data.bodyMimeType;
       if (Number.isFinite(data.size) && (!data.truncated || !entry.size)) {
         entry.size = data.size;
       }
@@ -341,7 +426,8 @@ function handleMessage(msg, sender, sendResponse) {
   if (msg.type === 'WS_MESSAGE') {
     const conn = wsConnections.get(msg.data.id);
     if (conn && conn.tabId === sender.tab.id && conn.frameId === sender.frameId) {
-      const rawData = String(msg.data.data ?? '');
+      const safeData = sanitizeData(msg.data);
+      const rawData = String(safeData.data ?? '');
       conn.messages.push({
         direction: msg.data.direction,
         type: msg.data.messageType === 'binary' ? 'binary' : 'text',
@@ -413,9 +499,9 @@ function handleMessage(msg, sender, sendResponse) {
     const replay = msg.data.options || {};
     const fetchOptions = {
       method: String(replay.method || req.method).toUpperCase(),
-      headers: replay.headers || req.requestHeaders,
+      headers: replayHeaders(replay.headers || req.replayHeaders || req.requestHeaders),
     };
-    const body = replay.body !== undefined ? replay.body : req.requestBody;
+    const body = replay.body !== undefined ? replay.body : (req.replayBody ?? req.requestBody);
     if (body && !['GET', 'HEAD'].includes(fetchOptions.method)) {
       fetchOptions.body = body;
     }
@@ -527,10 +613,11 @@ function handleMessage(msg, sender, sendResponse) {
     const visibleWs = tabId === null ? Array.from(wsConnections.values()) :
       Array.from(wsConnections.values()).filter(connection => connection.tabId === tabId);
     sendResponse({
-      requests: visibleRequests,
+      requests: visibleRequests.map(publicRequest),
       wsConnections: visibleWs,
       isCapturing,
       mockRules,
+      storageError,
     });
     return true;
   }
@@ -645,7 +732,7 @@ function generateHAR(requests) {
     request: {
       method: r.method,
       url: r.url,
-      httpVersion: 'HTTP/2',
+      httpVersion: 'unknown',
       headers: Object.entries(r.requestHeaders).map(([name, value]) => ({ name, value })),
       queryString: (() => {
         try {
@@ -653,7 +740,7 @@ function generateHAR(requests) {
         } catch { return []; }
       })(),
       headersSize: -1,
-      bodySize: r.requestBody ? r.requestBody.length : 0,
+      bodySize: r.requestBody ? byteLength(r.requestBody) : 0,
       postData: r.requestBody ? {
         mimeType: r.requestHeaders['content-type'] || r.requestHeaders['Content-Type'] || 'text/plain',
         text: r.requestBody,
@@ -662,12 +749,13 @@ function generateHAR(requests) {
     response: {
       status: r.status,
       statusText: r.statusText,
-      httpVersion: 'HTTP/2',
+      httpVersion: 'unknown',
       headers: Object.entries(r.responseHeaders).map(([name, value]) => ({ name, value })),
       content: {
         size: r.size || 0,
         mimeType: r.responseHeaders['content-type'] || 'text/plain',
         text: r.responseBody || '',
+        ...(r.bodyEncoding ? { encoding: r.bodyEncoding } : {}),
       },
       headersSize: -1,
       bodySize: r.size || 0,

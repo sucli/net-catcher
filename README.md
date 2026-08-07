@@ -80,9 +80,9 @@ git clone https://github.com/sucli/net-catcher.git
 ### 请求重放
 
 1. 点击选中一个请求
-2. 点击详情面板的「🔄 重放」按钮
-3. 在「重放结果」标签编辑方法、Headers、Body
-4. 切换到「重放结果」标签查看响应
+2. 打开「重放结果」标签，编辑方法、Headers、Body
+3. 点击详情面板的「🔄 重放」按钮
+4. 在「重放结果」标签查看响应
 
 ### Mock 响应
 
@@ -157,3 +157,13 @@ const captureId = crypto.randomUUID();
 ## 许可证
 
 MIT License
+
+## 开发检查
+
+```bash
+npm run check
+npm test
+npm run coverage
+```
+
+覆盖率命令覆盖 Service Worker、MAIN world 和 Bridge 的 VM 测试代码，并要求总体行覆盖率不低于 70%。

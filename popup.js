@@ -14,6 +14,8 @@ let compareMode = false;
 let activeTabId = null;
 let captureScope = 'current';
 let captureSettings = { redactSensitive: true, excludedHosts: [] };
+let replayDefaults = null;
+let lastStorageError = '';
 
 // 初始化
 document.addEventListener('DOMContentLoaded', () => {
@@ -42,6 +44,10 @@ function loadRequests() {
       allWsConnections = res.wsConnections || [];
       mockRules = res.mockRules || [];
       isCapturing = res.isCapturing;
+      if (res.storageError && res.storageError !== lastStorageError) {
+        lastStorageError = res.storageError;
+        showToast(`存储失败: ${res.storageError}`);
+      }
       updateToggleButton();
       updateCounts();
       if (currentView === 'http') { renderRequests(); updateStats(); }
@@ -333,11 +339,19 @@ function replayRequest() {
     btn.disabled = false;
     return;
   }
-  chrome.runtime.sendMessage({ type: 'REPLAY_REQUEST', data: { id, options: {
-    method: document.getElementById('replay-method').value,
+  const currentReplayMethod = document.getElementById('replay-method').value;
+  const currentReplayBody = document.getElementById('replay-body').value;
+  const currentReplayHeaders = document.getElementById('replay-headers').value;
+  const unchanged = replayDefaults && replayDefaults.id === id &&
+    replayDefaults.method === currentReplayMethod &&
+    replayDefaults.body === currentReplayBody &&
+    replayDefaults.headers === currentReplayHeaders;
+  const options = unchanged ? undefined : {
+    method: currentReplayMethod,
     headers: replayHeaders,
-    body: document.getElementById('replay-body').value,
-  } } }, (res) => {
+    body: currentReplayBody,
+  };
+  chrome.runtime.sendMessage({ type: 'REPLAY_REQUEST', data: { id, options } }, (res) => {
     btn.textContent = '🔄 重放';
     btn.disabled = false;
 
@@ -355,7 +369,7 @@ function replayRequest() {
         `<div class="replay-error">❌ 错误: ${escapeHtml(res.error)}</div>`;
     } else {
       let html = '<div class="replay-result">';
-      html += `<div class="replay-status ${res.status < 400 ? 'status-2xx' : 'status-5xx'}">${res.status} ${escapeHtml(res.statusText)}</div>`;
+      html += `<div class="replay-status ${getStatusClass(res.status)}">${res.status} ${escapeHtml(res.statusText)}</div>`;
       html += '<div class="header-section-title">响应头</div>';
       html += '<table class="header-table">';
       Object.entries(res.headers || {}).forEach(([k, v]) => {
@@ -768,6 +782,12 @@ function showDetail(id) {
     .map(method => `<option ${method === r.method ? 'selected' : ''}>${method}</option>`).join('');
   document.getElementById('replay-headers').value = JSON.stringify(r.requestHeaders || {}, null, 2);
   document.getElementById('replay-body').value = r.requestBody || '';
+  replayDefaults = {
+    id: r.id,
+    method: replayMethod.value,
+    headers: document.getElementById('replay-headers').value,
+    body: document.getElementById('replay-body').value,
+  };
   document.getElementById('replay-output').innerHTML = '<div class="no-data">点击「重放」按钮测试请求</div>';
 
   // 重置 tab
@@ -802,12 +822,17 @@ function renderPreview(r) {
 
   // 图片预览
   if (contentType.includes('image')) {
-    preview.innerHTML = `<div class="preview-image"><img src="${escapeHtml(r.url)}" alt="预览"><div class="no-data" style="display:none">图片加载失败</div></div>`;
-    const image = preview.querySelector('img');
-    image.addEventListener('error', () => {
-      image.style.display = 'none';
-      image.nextElementSibling.style.display = 'block';
-    });
+    if (r.bodyEncoding === 'base64' && r.responseBody) {
+      const mimeType = r.bodyMimeType || r.responseHeaders?.['content-type']?.split(';', 1)[0] || 'image/*';
+      preview.innerHTML = `<div class="preview-image"><img src="data:${escapeHtml(mimeType)};base64,${escapeHtml(r.responseBody)}" alt="预览"><div class="no-data" style="display:none">图片加载失败</div></div>`;
+      const image = preview.querySelector('img');
+      image.addEventListener('error', () => {
+        image.style.display = 'none';
+        image.nextElementSibling.style.display = 'block';
+      });
+    } else {
+      preview.innerHTML = '<div class="no-data">图片响应未保留在捕获大小限制内</div>';
+    }
     return;
   }
 
@@ -988,12 +1013,12 @@ function generateCurl(r) {
   let parts = [`curl -X ${r.method} ${shellQuote(r.url)}`];
   if (r.requestHeaders) {
     Object.entries(r.requestHeaders).forEach(([k, v]) => {
-      if (!['host', 'connection', 'origin', 'referer'].includes(k.toLowerCase())) {
+      if (!['host', 'connection', 'origin', 'referer'].includes(k.toLowerCase()) && !String(v).includes('[REDACTED]')) {
         parts.push(`-H ${shellQuote(`${k}: ${v}`)}`);
       }
     });
   }
-  if (r.requestBody && ['POST', 'PUT', 'PATCH'].includes(r.method)) {
+  if (r.requestBody && !r.requestBody.includes('[REDACTED]') && !['GET', 'HEAD'].includes(r.method)) {
     parts.push(`-d ${shellQuote(r.requestBody)}`);
   }
   return parts.join(' \\\n  ');

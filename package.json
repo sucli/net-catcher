@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "check": "node --check background.js && node --check content_script_bridge.js && node --check content_script_main.js && node --check popup.js",
-    "test": "node --test"
+    "test": "node --test",
+    "coverage": "node --test --experimental-test-coverage --test-coverage-lines=70 --test-coverage-include=background.js --test-coverage-include=content_script_main.js --test-coverage-include=content_script_bridge.js"
   }
 }

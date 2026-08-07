@@ -26,6 +26,7 @@ class FakeWindow {
         __netCatcherResponse: true,
         messageId: data.messageId,
         response,
+        nonce: data.nonce,
       }));
     }
   }
@@ -72,7 +73,7 @@ function loadMainScript({ responder, fetchImpl = async () => new Response('ok') 
 
     open() { this.readyState = 1; }
     send() { LocalXMLHttpRequest.networkCalls += 1; }
-    abort() {}
+    abort() { this.dispatchEvent(new Event('abort')); }
     setRequestHeader() {}
     getAllResponseHeaders() { return ''; }
   }
@@ -105,7 +106,8 @@ function loadMainScript({ responder, fetchImpl = async () => new Response('ok') 
     queueMicrotask,
   });
   const source = fs.readFileSync(path.join(projectRoot, 'content_script_main.js'), 'utf8');
-  vm.runInContext(source, context);
+  vm.runInContext(source, context, { filename: path.join(projectRoot, 'content_script_main.js') });
+  window.emitMessage({ __netCatcherBridgeReady: true, nonce: 'test-bridge' });
   return { context, window, XMLHttpRequest: LocalXMLHttpRequest };
 }
 
@@ -123,13 +125,25 @@ test('bridge forwards capture events and blocks page control commands', async ()
       },
     },
   });
-  vm.runInContext(fs.readFileSync(path.join(projectRoot, 'content_script_bridge.js'), 'utf8'), context);
+  vm.runInContext(fs.readFileSync(path.join(projectRoot, 'content_script_bridge.js'), 'utf8'), context, {
+    filename: path.join(projectRoot, 'content_script_bridge.js'),
+  });
 
+  window.emitMessage({ __netCatcher: true, __netCatcherHello: true });
+  const bridgeReady = window.messages.find(message => message.__netCatcherBridgeReady);
   window.emitMessage({ __netCatcher: true, type: 'CLEAR_REQUESTS', data: {} });
+  window.emitMessage({
+    __netCatcher: true,
+    messageId: 'spoofed',
+    type: 'NET_REQUEST',
+    nonce: 'wrong-nonce',
+    data: { captureId: 'spoofed' },
+  });
   window.emitMessage({
     __netCatcher: true,
     messageId: 'request-1',
     type: 'NET_REQUEST',
+    nonce: bridgeReady.nonce,
     data: { captureId: 'capture-1' },
   });
   await new Promise(resolve => setImmediate(resolve));
@@ -206,7 +220,7 @@ test('fetch does not wait for the bridge when no mock rules are active', async (
     },
   });
   window.location = { href: 'https://example.test/page' };
-  window.emitMessage({ __netCatcherConfig: true, hasActiveMockRules: false });
+  window.emitMessage({ __netCatcherConfig: true, hasActiveMockRules: false, nonce: 'test-bridge' });
 
   const response = await Promise.race([
     window.fetch('/fast'),
@@ -216,6 +230,18 @@ test('fetch does not wait for the bridge when no mock rules are active', async (
   assert.equal(await response.text(), 'network');
   const request = window.messages.find(message => message.type === 'NET_REQUEST');
   assert.equal(request.data.url, 'https://example.test/fast');
+});
+
+test('fetch captures a Request object body', async () => {
+  const { window } = loadMainScript({ responder: () => ({ mocked: false }) });
+  const request = new Request('https://example.test/request-body', {
+    method: 'POST',
+    body: 'name=netcatcher',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+  });
+  await window.fetch(request);
+  const capture = window.messages.find(message => message.type === 'NET_REQUEST');
+  assert.equal(capture.data.requestBody, 'name=netcatcher');
 });
 
 test('XMLHttpRequest mock completes without issuing the network request', async () => {
@@ -245,6 +271,44 @@ test('XMLHttpRequest mock completes without issuing the network request', async 
   assert.equal(xhr.responseText, '{"from":"mock"}');
 });
 
+test('XMLHttpRequest capture listeners do not leak when the object is reused', async () => {
+  const { XMLHttpRequest, window } = loadMainScript({
+    responder: message => message.type === 'NET_REQUEST' ? {
+      mocked: true,
+      mockResponse: { status: 200, headers: {}, body: 'ok' },
+    } : null,
+  });
+  const xhr = new XMLHttpRequest();
+  xhr.open('GET', 'https://example.test/first', true);
+  xhr.send();
+  await new Promise(resolve => setImmediate(resolve));
+  xhr.open('GET', 'https://example.test/second', true);
+  xhr.send();
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(window.messages.filter(message => message.type === 'NET_REQUEST').length, 2);
+  assert.equal(window.messages.filter(message => message.type === 'NET_RESPONSE').length, 0);
+});
+
+test('delayed XMLHttpRequest mock is cancelled by abort', async () => {
+  const { XMLHttpRequest, window } = loadMainScript({
+    responder: message => message.type === 'NET_REQUEST' ? {
+      mocked: true,
+      mockResponse: { status: 200, headers: {}, body: 'late', delay: 20 },
+    } : null,
+  });
+  const xhr = new XMLHttpRequest();
+  let loaded = 0;
+  xhr.addEventListener('load', () => { loaded += 1; });
+  xhr.open('GET', 'https://example.test/abort', true);
+  xhr.send();
+  await new Promise(resolve => setImmediate(resolve));
+  xhr.abort();
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(loaded, 0);
+  assert.equal(window.messages.some(message => message.type === 'NET_ERROR' && message.data.error === 'Aborted'), true);
+});
+
 test('WebSocket page handlers still run and capture IDs use absolute time', () => {
   const { window } = loadMainScript({ responder: () => null });
   const socket = new window.WebSocket('wss://example.test/socket');
@@ -263,14 +327,14 @@ test('WebSocket page handlers still run and capture IDs use absolute time', () =
   assert.equal(window.messages.filter(message => message.type === 'WS_READY').length, 1);
 });
 
-function createBackgroundHarness(storageData = {}) {
+function createBackgroundHarness(storageData = {}, storageSet = null) {
   let listener;
   const writes = [];
   const chrome = {
     storage: {
       local: {
         get: async () => storageData,
-        set: data => { writes.push(data); return Promise.resolve(); },
+        set: data => { writes.push(data); return storageSet ? storageSet(data) : Promise.resolve(); },
       },
     },
     runtime: {
@@ -282,7 +346,9 @@ function createBackgroundHarness(storageData = {}) {
     },
   };
   const context = vm.createContext({ chrome, fetch: async () => new Response('ok'), Date, Map, Set, URL, console });
-  vm.runInContext(fs.readFileSync(path.join(projectRoot, 'background.js'), 'utf8'), context);
+  vm.runInContext(fs.readFileSync(path.join(projectRoot, 'background.js'), 'utf8'), context, {
+    filename: path.join(projectRoot, 'background.js'),
+  });
 
   const dispatch = (message, sender) => new Promise(resolve => listener(message, sender, resolve));
   return { dispatch, writes };
@@ -350,12 +416,25 @@ test('background applies sensitive-data redaction and excludes configured hosts'
   assert.equal(excluded, null);
 
   await dispatch({ type: 'NET_REQUEST', data: {
-    captureId: 'redacted', url: 'https://api.example.test/data', startTime: 1, type: 'fetch',
-    requestHeaders: { Authorization: 'secret' }, requestBody: '{"token":"secret"}',
+    captureId: 'redacted', url: 'https://api.example.test/data?token=secret', startTime: 1, type: 'fetch',
+    requestHeaders: { Authorization: 'secret' }, requestBody: 'password=secret&name=ok',
   } }, sender);
   const result = await dispatch({ type: 'GET_REQUESTS', data: { tabId: 3 } }, popupSender);
   assert.equal(result.requests[0].requestHeaders.Authorization, '[REDACTED]');
-  assert.equal(result.requests[0].requestBody, '{"token":"[REDACTED]"}');
+  assert.equal(result.requests[0].requestBody, 'password=%5BREDACTED%5D&name=ok');
+  assert.match(result.requests[0].url, /token=%5BREDACTED%5D/);
+});
+
+test('background exposes storage write failures to the popup', async () => {
+  const { dispatch } = createBackgroundHarness({}, () => Promise.reject(new Error('QUOTA_BYTES')));
+  const popupSender = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' };
+  const sender = { id: 'extension-id', tab: { id: 6 }, frameId: 0 };
+  await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'quota', url: 'https://example.test/quota', startTime: 1, type: 'fetch',
+  } }, sender);
+  await new Promise(resolve => setImmediate(resolve));
+  const result = await dispatch({ type: 'GET_REQUESTS', data: { tabId: 6 } }, popupSender);
+  assert.equal(result.storageError, 'QUOTA_BYTES');
 });
 
 test('background isolates requests by tab and supports method-specific mocks', async () => {
