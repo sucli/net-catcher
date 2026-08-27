@@ -126,7 +126,33 @@ const initialization = chrome.storage.local.get([
 }).catch(() => {});
 
 // 持久化存储
+// 高频捕获事件（webRequest、WS 消息、SSE chunk）会非常频繁地触发写入，
+// 直接每次都调用 chrome.storage.local.set 会造成大量重复的全量快照序列化写盘。
+// 这里做“首次立即写 + 之后在 PERSIST_MIN_INTERVAL_MS 窗口内合并为一次尾部写”的节流，
+// 既保证首个错误/状态能及时落盘，又把突发流量下的写入次数压到最低。
+const PERSIST_MIN_INTERVAL_MS = 500;
+let persistTimer = null;
+let lastPersistTime = 0;
+
 function persist() {
+  if (persistTimer) return persistQueue;
+  const elapsed = Date.now() - lastPersistTime;
+  if (elapsed >= PERSIST_MIN_INTERVAL_MS) return flushPersist();
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    flushPersist();
+  }, PERSIST_MIN_INTERVAL_MS - elapsed);
+  return persistQueue;
+}
+
+// 立即写入当前状态并取消任何待处理的合并写。会话切换等依赖“先落盘再读盘”的
+// 操作必须用它，避免被节流延迟导致读到旧快照。
+function flushPersist() {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  lastPersistTime = Date.now();
   const snapshot = createPersistedSnapshot();
   const session = sessions.find(item => item.id === activeSessionId);
   if (session) session.updatedAt = Date.now();
@@ -306,6 +332,27 @@ function findNetworkRecordForCapture(data, sender) {
   return match;
 }
 
+// onBeforeRequest 与内容脚本的 NET_REQUEST 是两条独立的建条目路径，谁先到取决于
+// postMessage→bridge→runtime 的异步跳转与 webRequest 回调的相对时序。若内容脚本条目
+// 先建好，这里要找到它并挂接 webRequest 元数据，而不是再建一条 network-only 条目，
+// 否则同一个 fetch/xhr 会出现两条重复记录。
+function findContentEntryForRecord(record) {
+  let match = null;
+  let distance = Infinity;
+  for (const entry of requests) {
+    if (!entry.captureId || entry.webRequestId) continue;
+    if (entry.tabId !== record.tabId || entry.frameId !== record.frameId) continue;
+    if (entry.type !== 'fetch' && entry.type !== 'xhr') continue;
+    if (validRequestMethod(entry.method) !== validRequestMethod(record.method)) continue;
+    if (!networkUrlMatches(entry.url, record.url)) continue;
+    const delta = Math.abs(Number(entry.startTime) - Number(record.startTime));
+    if (delta > 5000 || delta >= distance) continue;
+    match = entry;
+    distance = delta;
+  }
+  return match;
+}
+
 function attachNetworkRecord(entry, record) {
   if (!entry || !record) return;
   record.entryId = entry.id;
@@ -393,10 +440,19 @@ function registerWebRequestListeners() {
     if (networkRecords.size > MAX_NETWORK_RECORDS) {
       networkRecords.delete(networkRecords.keys().next().value);
     }
-    const entry = createNetworkOnlyEntry(record);
+    // fetch/xhr 可能已由内容脚本先建好条目——优先挂接，避免重复。
+    let entry = null;
+    if (record.type === 'fetch' || record.type === 'xmlhttprequest') {
+      const contentEntry = findContentEntryForRecord(record);
+      if (contentEntry) {
+        attachNetworkRecord(contentEntry, record);
+        record.captured = true;
+        entry = contentEntry;
+      }
+    }
+    if (!entry) createNetworkOnlyEntry(record);
     persist();
     broadcastUpdate();
-    return entry;
   }, filter);
 
   chrome.webRequest.onBeforeSendHeaders?.addListener(details => {
@@ -431,6 +487,19 @@ function registerWebRequestListeners() {
   }, filter);
 }
 
+// Mock 规则的正则按 pattern 缓存：同一 pattern 编译结果不变，避免每个请求重复
+// 构造 RegExp（同时缓存编译失败的 null）。注意用户提供的 pattern 仍可能是灾难性
+// 回溯的正则，这属于用户自定义规则的固有风险；此处只做编译层面的缓存与容错。
+const mockRegexCache = new Map();
+function compileMockRegex(pattern) {
+  if (mockRegexCache.has(pattern)) return mockRegexCache.get(pattern);
+  let regex = null;
+  try { regex = new RegExp(pattern); } catch { regex = null; }
+  if (mockRegexCache.size > 200) mockRegexCache.clear();
+  mockRegexCache.set(pattern, regex);
+  return regex;
+}
+
 // 匹配 Mock 规则
 function matchMockRule(url, method = '', requestHeaders = {}, requestBody = '') {
   const normalizedHeaders = Object.fromEntries(Object.entries(requestHeaders || {})
@@ -453,11 +522,8 @@ function matchMockRule(url, method = '', requestHeaders = {}, requestBody = '') 
     }
     if (rule.matchBody && !String(requestBody || '').includes(String(rule.matchBody))) return false;
     if (rule.isRegex) {
-      try {
-        return new RegExp(rule.pattern).test(url);
-      } catch {
-        return false;
-      }
+      const regex = compileMockRegex(rule.pattern);
+      return regex ? regex.test(url) : false;
     }
     return url.includes(rule.pattern);
   });
@@ -511,19 +577,19 @@ function clearCaptureState() {
 async function switchSession(sessionId) {
   const target = sessions.find(session => session.id === sessionId);
   if (!target) return { error: '会话不存在' };
-  await persist();
+  await flushPersist();
   const stored = await chrome.storage.local.get(sessionStorageKey(target.id));
   activeSessionId = target.id;
   applySessionSnapshot(stored?.[sessionStorageKey(target.id)] || {});
   networkRecords.clear();
   target.updatedAt = Date.now();
-  await persist();
+  await flushPersist();
   broadcastUpdate();
   return { ok: true, sessions, activeSessionId };
 }
 
 async function createSession(name) {
-  await persist();
+  await flushPersist();
   const id = `session-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
   const session = {
     id,
@@ -534,7 +600,7 @@ async function createSession(name) {
   sessions = [...sessions, session].slice(-MAX_SESSIONS);
   activeSessionId = id;
   clearCaptureState();
-  await persist();
+  await flushPersist();
   broadcastUpdate();
   return { ok: true, sessions, activeSessionId };
 }
@@ -554,7 +620,7 @@ async function deleteSession(sessionId) {
     sessions = remaining;
   }
   if (chrome.storage.local.remove) await chrome.storage.local.remove(sessionStorageKey(sessionId));
-  await persist();
+  await flushPersist();
   broadcastUpdate();
   return { ok: true, sessions, activeSessionId };
 }
@@ -839,7 +905,7 @@ function handleMessage(msg, sender, sendResponse) {
       entry.responseBody = mockResponse.body || null;
       entry.endTime = Date.now();
       entry.duration = Math.max(0, entry.endTime - entry.startTime);
-      entry.size = mockResponse.body ? mockResponse.body.length : 0;
+      entry.size = byteLength(mockResponse.body);
     }
 
     persist();
@@ -963,6 +1029,8 @@ function handleMessage(msg, sender, sendResponse) {
     if (conn && conn.tabId === sender.tab.id && conn.frameId === sender.frameId) {
       const safeData = sanitizeData(msg.data);
       const rawData = String(safeData.data ?? '');
+      // 若脱敏实际改动了消息内容，则同源的 hex 摘要也可能泄露原始字节，一并丢弃保持一致。
+      const contentRedacted = settings.redactSensitive && rawData !== String(msg.data.data ?? '');
       conn.messages.push({
         direction: msg.data.direction,
         type: msg.data.messageType === 'binary' ? 'binary' : 'text',
@@ -970,7 +1038,7 @@ function handleMessage(msg, sender, sendResponse) {
         truncated: rawData.length > MAX_WS_MESSAGE_CHARS,
         encoding: msg.data.dataEncoding || null,
         size: Number(msg.data.dataSize) || (msg.data.messageType === 'binary' ? null : rawData.length),
-        hex: typeof msg.data.dataHex === 'string' ? msg.data.dataHex.slice(0, 1024) : null,
+        hex: (!contentRedacted && typeof msg.data.dataHex === 'string') ? msg.data.dataHex.slice(0, 1024) : null,
         timestamp: msg.data.timestamp,
       });
       if (msg.data.direction === 'send' || msg.data.direction === 'receive') {

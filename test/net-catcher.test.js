@@ -368,7 +368,7 @@ function createBackgroundHarness(storageData = {}, storageSet = null) {
       sendMessage: async () => {},
     },
   };
-  const context = vm.createContext({ chrome, fetch: async () => new Response('ok'), Date, Map, Set, URL, console });
+  const context = vm.createContext({ chrome, fetch: async () => new Response('ok'), Date, Map, Set, URL, console, setTimeout, clearTimeout });
   vm.runInContext(fs.readFileSync(path.join(projectRoot, 'background.js'), 'utf8'), context, {
     filename: path.join(projectRoot, 'background.js'),
   });
@@ -557,6 +557,28 @@ test('webRequest metadata is captured and merged with page-level fetch events', 
   const merged = result.requests.find(request => request.captureId === 'page-fetch');
   assert.equal(merged.webRequestId, 'network-2');
   assert.equal(merged.status, 204);
+});
+
+test('page fetch arriving before webRequest does not create a duplicate entry', async () => {
+  const { dispatch, webRequest } = createBackgroundHarness();
+  const popupSender = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' };
+  const sender = { id: 'extension-id', tab: { id: 21 }, frameId: 0 };
+
+  // Content-script capture lands first (the common race), then the network layer sees it.
+  await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'race-fetch', url: 'https://example.test/race', method: 'GET', startTime: 300, type: 'fetch',
+  } }, sender);
+  webRequest.onBeforeRequest.emit({
+    requestId: 'network-race', url: 'https://example.test/race', method: 'GET',
+    type: 'fetch', tabId: 21, frameId: 0, timeStamp: 300,
+  });
+  webRequest.onCompleted.emit({ requestId: 'network-race', statusCode: 200, timeStamp: 320 });
+
+  const result = await dispatch({ type: 'GET_REQUESTS', data: { tabId: 21 } }, popupSender);
+  assert.equal(result.requests.length, 1);
+  assert.equal(result.requests[0].captureId, 'race-fetch');
+  assert.equal(result.requests[0].webRequestId, 'network-race');
+  assert.equal(result.requests[0].status, 200);
 });
 
 test('named sessions isolate capture data and expose session metadata', async () => {
