@@ -7,74 +7,104 @@
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
-  <!-- 顶部工具栏 -->
-  <div class="toolbar">
-    <div class="toolbar-left">
-      <span class="logo">🔍 NetCatcher</span>
-      <div class="tab-group">
-        <button id="tab-http" class="tab-btn active" data-view="http">HTTP <span id="http-count">0</span></button>
-        <button id="tab-ws" class="tab-btn" data-view="ws">WS <span id="ws-count">0</span></button>
-        <button id="tab-timeline" class="tab-btn" data-view="timeline">时间线</button>
-        <button id="tab-mock" class="tab-btn" data-view="mock">Mock</button>
-      </div>
+  <header class="topbar">
+    <div class="brand" title="NetCatcher">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">NetCatcher</span>
     </div>
-    <div class="toolbar-right">
-      <select id="saved-filters" class="filter-select" title="已保存的过滤器">
-        <option value="">过滤器...</option>
-      </select>
-      <button id="btn-delete-filter" class="btn btn-small" title="删除选中的过滤器">✕</button>
-      <select id="session-select" class="filter-select" title="抓包会话">
-        <option value="">会话...</option>
-      </select>
-      <button id="btn-new-session" class="btn btn-small" title="新建会话">＋</button>
-      <button id="btn-delete-session" class="btn btn-small btn-red" title="删除当前会话">🗑</button>
-      <select id="scenario-select" class="filter-select" title="测试场景">
-        <option value="">测试场景...</option>
-      </select>
-      <button id="btn-save-scenario" class="btn btn-small" title="保存选中请求为场景">场景＋</button>
-      <button id="btn-run-scenario" class="btn btn-small btn-green" title="运行测试场景">测试▶</button>
-      <button id="btn-delete-scenario" class="btn btn-small btn-red" title="删除测试场景">场景×</button>
-      <select id="capture-scope" class="filter-select" title="请求范围">
+
+    <nav class="view-tabs" aria-label="视图">
+      <button id="tab-http" class="tab-btn active" data-view="http">
+        HTTP <span class="tab-count" id="http-count">0</span>
+      </button>
+      <button id="tab-ws" class="tab-btn" data-view="ws">
+        WS <span class="tab-count" id="ws-count">0</span>
+      </button>
+      <button id="tab-timeline" class="tab-btn" data-view="timeline">时间线</button>
+      <button id="tab-mock" class="tab-btn" data-view="mock">Mock</button>
+    </nav>
+
+    <div class="topbar-actions">
+      <select id="capture-scope" class="control control-compact" title="请求范围">
         <option value="current">当前标签页</option>
         <option value="all">全部标签页</option>
       </select>
-      <button id="btn-save-filter" class="btn btn-small" title="保存当前过滤条件">💾</button>
-      <button id="btn-toggle" class="btn btn-green" title="暂停/恢复">⏸</button>
-      <button id="btn-clear" class="btn btn-red" title="清除记录">🗑</button>
-      <button id="btn-export" class="btn btn-blue" title="导出 HAR">📥</button>
-      <button id="btn-export-openapi" class="btn btn-blue" title="导出 OpenAPI">API↓</button>
-      <button id="btn-import-har" class="btn btn-blue" title="导入 HAR">📤</button>
-      <button id="btn-import-curl" class="btn btn-blue" title="导入 cURL">cURL↑</button>
-      <button id="btn-batch-replay" class="btn btn-green" title="批量重放已选请求">▶▶</button>
-      <button id="btn-open-sidepanel" class="btn btn-small" title="在侧边栏打开">◧</button>
+      <button id="btn-toggle" class="btn btn-ghost capture-toggle" title="暂停/恢复捕获">
+        <span class="capture-dot live" id="capture-dot" aria-hidden="true"></span>
+        <span id="capture-label">捕获中</span>
+      </button>
+      <button id="btn-clear" class="btn btn-ghost btn-danger-ghost" title="清除记录">清空</button>
+      <button id="btn-open-sidepanel" class="btn btn-ghost" title="在侧边栏打开">侧栏</button>
+      <div class="menu-anchor">
+        <button id="btn-more" class="btn btn-ghost menu-trigger" title="更多操作" aria-haspopup="true" aria-expanded="false">更多</button>
+        <div id="more-menu" class="more-menu" hidden>
+          <section class="menu-section">
+            <div class="menu-label">会话</div>
+            <div class="menu-row">
+              <select id="session-select" class="control" title="抓包会话">
+                <option value="">选择会话...</option>
+              </select>
+              <button id="btn-new-session" class="btn btn-ghost btn-tiny" title="新建会话">新建</button>
+              <button id="btn-delete-session" class="btn btn-ghost btn-tiny btn-danger-ghost" title="删除当前会话">删除</button>
+            </div>
+          </section>
+          <section class="menu-section">
+            <div class="menu-label">测试场景</div>
+            <div class="menu-row">
+              <select id="scenario-select" class="control" title="测试场景">
+                <option value="">选择场景...</option>
+              </select>
+            </div>
+            <div class="menu-row">
+              <button id="btn-save-scenario" class="btn btn-ghost btn-tiny" title="保存选中请求为场景">保存所选</button>
+              <button id="btn-run-scenario" class="btn btn-ghost btn-tiny" title="运行测试场景">运行</button>
+              <button id="btn-delete-scenario" class="btn btn-ghost btn-tiny btn-danger-ghost" title="删除测试场景">删除</button>
+            </div>
+          </section>
+          <section class="menu-section">
+            <div class="menu-label">导入 / 导出</div>
+            <div class="menu-grid">
+              <button id="btn-import-har" class="btn btn-ghost btn-tiny">导入 HAR</button>
+              <button id="btn-import-curl" class="btn btn-ghost btn-tiny">导入 cURL</button>
+              <button id="btn-export" class="btn btn-ghost btn-tiny">导出 HAR</button>
+              <button id="btn-export-openapi" class="btn btn-ghost btn-tiny">导出 OpenAPI</button>
+              <button id="btn-batch-replay" class="btn btn-ghost btn-tiny">批量重放</button>
+            </div>
+          </section>
+          <section class="menu-section">
+            <div class="menu-label">设置</div>
+            <label class="check-row"><input type="checkbox" id="chk-auto-scroll" checked> 自动滚动到最新</label>
+            <label class="check-row"><input type="checkbox" id="chk-redact" checked> 敏感字段脱敏</label>
+            <label class="field-stack">
+              <span>排除域名</span>
+              <input type="text" id="excluded-hosts" class="control" placeholder="example.com, *.cdn.com">
+            </label>
+          </section>
+        </div>
+      </div>
       <input id="har-file-input" type="file" accept=".har,.json" hidden>
-      <label class="auto-scroll-toggle" title="自动滚动到最新请求">
-        <input type="checkbox" id="chk-auto-scroll" checked>
-        <span>滚动</span>
-      </label>
-      <label class="auto-scroll-toggle" title="隐藏常见敏感字段">
-        <input type="checkbox" id="chk-redact" checked>
-        <span>脱敏</span>
-      </label>
     </div>
+  </header>
+
+  <div class="status-strip" id="stats-bar">
+    <span class="status-live" id="status-live">
+      <span class="capture-dot live" id="status-capture-dot" aria-hidden="true"></span>
+      <span id="status-live-text">采集中</span>
+    </span>
+    <span class="status-divider" aria-hidden="true"></span>
+    <span class="stat"><b id="stat-total">0</b><span>总计</span></span>
+    <span class="stat ok"><b id="stat-2xx">0</b><span>2xx</span></span>
+    <span class="stat warn"><b id="stat-3xx">0</b><span>3xx</span></span>
+    <span class="stat mid"><b id="stat-4xx">0</b><span>4xx</span></span>
+    <span class="stat err"><b id="stat-5xx">0</b><span>5xx</span></span>
+    <span class="stat fail"><b id="stat-err">0</b><span>失败</span></span>
+    <span class="stat time"><span>平均</span><b id="stat-avg-time">-</b></span>
   </div>
 
-  <!-- HTTP 请求统计栏 -->
-  <div class="stats-bar" id="stats-bar">
-    <span class="stat stat-total"><b id="stat-total">0</b> 总计</span>
-    <span class="stat stat-2xx"><b id="stat-2xx">0</b> 成功</span>
-    <span class="stat stat-3xx"><b id="stat-3xx">0</b> 重定向</span>
-    <span class="stat stat-4xx"><b id="stat-4xx">0</b> 客户端</span>
-    <span class="stat stat-5xx"><b id="stat-5xx">0</b> 服务端</span>
-    <span class="stat stat-err"><b id="stat-err">0</b> 失败</span>
-    <span class="stat stat-time">平均 <b id="stat-avg-time">-</b></span>
-  </div>
-
-  <!-- 过滤栏 -->
   <div class="filter-bar" id="filter-bar">
-    <input type="text" id="filter-url" placeholder="🔍 搜索 URL..." class="filter-input">
-    <select id="filter-method" class="filter-select">
-      <option value="">全部方法</option>
+    <input type="text" id="filter-url" placeholder="搜索 URL..." class="control search-input" spellcheck="false">
+    <select id="filter-method" class="control control-compact">
+      <option value="">方法</option>
       <option value="GET">GET</option>
       <option value="POST">POST</option>
       <option value="PUT">PUT</option>
@@ -83,89 +113,117 @@
       <option value="OPTIONS">OPTIONS</option>
       <option value="HEAD">HEAD</option>
     </select>
-    <select id="filter-status" class="filter-select">
-      <option value="">全部状态</option>
+    <select id="filter-status" class="control control-compact">
+      <option value="">状态</option>
       <option value="2xx">2xx</option>
       <option value="3xx">3xx</option>
       <option value="4xx">4xx</option>
       <option value="5xx">5xx</option>
       <option value="0">失败</option>
     </select>
-    <select id="filter-type" class="filter-select">
-      <option value="">全部类型</option>
+    <select id="filter-type" class="control control-compact">
+      <option value="">类型</option>
       <option value="fetch">Fetch</option>
       <option value="xhr">XHR</option>
-      <option value="eventsource">EventSource</option>
+      <option value="eventsource">SSE</option>
       <option value="beacon">Beacon</option>
       <option value="network">网络层</option>
     </select>
-    <select id="filter-sort" class="filter-select">
-      <option value="time-desc">时间 ↓</option>
-      <option value="time-asc">时间 ↑</option>
-      <option value="duration-desc">耗时 ↓</option>
-      <option value="duration-asc">耗时 ↑</option>
-      <option value="size-desc">大小 ↓</option>
-      <option value="size-asc">大小 ↑</option>
+    <select id="filter-sort" class="control control-compact">
+      <option value="time-desc">时间↓</option>
+      <option value="time-asc">时间↑</option>
+      <option value="duration-desc">耗时↓</option>
+      <option value="duration-asc">耗时↑</option>
+      <option value="size-desc">大小↓</option>
+      <option value="size-asc">大小↑</option>
     </select>
-    <button id="btn-group-toggle" class="btn btn-small" title="分组显示">📁</button>
-    <label class="auto-scroll-toggle"><input type="checkbox" id="filter-starred"><span>收藏</span></label>
-    <input type="text" id="excluded-hosts" placeholder="排除域名，用逗号分隔" class="filter-input excluded-hosts">
-  </div>
-
-  <!-- HTTP 请求列表 -->
-  <div class="request-list" id="request-list">
-    <div class="empty-state" id="empty-state">
-      <div class="empty-icon">📡</div>
-      <div>等待网络请求...</div>
-      <div class="empty-hint">在当前页面刷新或操作以捕获请求</div>
+    <button id="btn-group-toggle" class="btn btn-ghost btn-tiny" title="按域名分组">分组</button>
+    <label class="chip-check" title="仅显示收藏"><input type="checkbox" id="filter-starred"><span>收藏</span></label>
+    <div class="filter-saved">
+      <select id="saved-filters" class="control control-compact" title="已保存的过滤器">
+        <option value="">已存过滤器</option>
+      </select>
+      <button id="btn-save-filter" class="btn btn-ghost btn-tiny" title="保存当前过滤条件">存</button>
+      <button id="btn-delete-filter" class="btn btn-ghost btn-tiny btn-danger-ghost" title="删除选中的过滤器">删</button>
     </div>
   </div>
 
-  <!-- WebSocket 连接列表 -->
-  <div class="filter-bar" id="ws-filter-bar" style="display:none">
-    <input id="ws-filter" class="filter-input" placeholder="搜索 URL 或消息">
-    <select id="ws-direction" class="filter-select"><option value="">全部方向</option><option value="send">发送</option><option value="receive">接收</option></select>
+  <div class="filter-bar" id="ws-filter-bar" hidden>
+    <input id="ws-filter" class="control search-input" placeholder="搜索 URL 或消息" spellcheck="false">
+    <select id="ws-direction" class="control control-compact">
+      <option value="">方向</option>
+      <option value="send">发送</option>
+      <option value="receive">接收</option>
+    </select>
   </div>
-  <div class="ws-list" id="ws-list" style="display:none">
-    <div class="empty-state" id="ws-empty-state">
-      <div class="empty-icon">🔌</div>
-      <div>等待 WebSocket 连接...</div>
+
+  <div class="col-header" id="http-col-header">
+    <span class="col-method">方法</span>
+    <span class="col-url">地址</span>
+    <span class="col-status">状态</span>
+    <span class="col-duration">耗时</span>
+    <span class="col-size">大小</span>
+  </div>
+
+  <div class="col-header" id="ws-col-header" hidden>
+    <span class="col-method">状态</span>
+    <span class="col-url">连接地址</span>
+    <span class="col-status">消息</span>
+    <span class="col-duration">时长</span>
+  </div>
+
+  <main class="content-area">
+    <div class="request-list list-scroll" id="request-list">
+      <div class="empty-state" id="empty-state">
+        <div class="empty-symbol" aria-hidden="true">◈</div>
+        <div class="empty-title">等待网络请求</div>
+        <div class="empty-hint">刷新页面或触发接口调用后，请求会出现在这里</div>
+        <div class="empty-kbd">Ctrl/⌘ + 点击可多选对比 · ↑↓ 切换 · Esc 关闭</div>
+      </div>
     </div>
-  </div>
 
-  <!-- 时间线视图 -->
-  <div class="timeline-view" id="timeline-view" style="display:none">
-    <div class="timeline-container" id="timeline-container"></div>
-  </div>
-
-  <!-- Mock 规则视图 -->
-  <div class="mock-view" id="mock-view" style="display:none">
-    <div class="mock-toolbar">
-      <button id="btn-add-mock" class="btn btn-green">+ 添加规则</button>
-      <span class="mock-hint">匹配的请求将返回自定义响应</span>
+    <div class="ws-list list-scroll" id="ws-list" hidden>
+      <div class="empty-state" id="ws-empty-state">
+        <div class="empty-symbol" aria-hidden="true">⬡</div>
+        <div class="empty-title">等待 WebSocket 连接</div>
+        <div class="empty-hint">页面建立 WS 连接后可查看收发消息并重放</div>
+      </div>
     </div>
-    <div class="mock-list" id="mock-list"></div>
-  </div>
 
-  <!-- HTTP 详情面板 -->
+    <div class="timeline-view list-scroll" id="timeline-view" hidden>
+      <div class="timeline-container" id="timeline-container"></div>
+    </div>
+
+    <div class="mock-view" id="mock-view" hidden>
+      <div class="mock-toolbar">
+        <button id="btn-add-mock" class="btn btn-primary">新建规则</button>
+        <span class="mock-hint">启用后，匹配请求将直接返回自定义响应</span>
+      </div>
+      <div class="mock-list list-scroll" id="mock-list"></div>
+    </div>
+  </main>
+
   <div class="detail-overlay" id="detail-overlay" style="display:none">
     <div class="detail-panel">
       <div class="detail-header">
-        <span id="detail-title">请求详情</span>
+        <span class="detail-title" id="detail-title">请求详情</span>
         <div class="detail-actions">
-          <button id="btn-replay" class="btn btn-green" title="重放请求">🔄 重放</button>
-          <button id="btn-star" class="btn btn-small" title="收藏">⭐</button>
-          <button id="btn-curl" class="btn btn-blue" title="复制 cURL">📋 cURL</button>
-          <button id="btn-close-detail" class="btn-close">✕</button>
+          <button id="btn-replay" class="btn btn-primary" title="重放请求">重放</button>
+          <button id="btn-star" class="btn btn-ghost btn-tiny" title="收藏">收藏</button>
+          <button id="btn-curl" class="btn btn-ghost btn-tiny" title="复制 cURL">cURL</button>
+          <button id="btn-close-detail" class="btn-close" title="关闭" aria-label="关闭">✕</button>
         </div>
       </div>
-      <div class="detail-tags"><label for="detail-tags">标签</label><input id="detail-tags" class="form-input" placeholder="逗号分隔"></div>
+      <div class="detail-tags">
+        <label for="detail-tags">标签</label>
+        <input id="detail-tags" class="control" placeholder="逗号分隔，便于筛选归类">
+      </div>
       <div class="assertion-editor">
-        <label>断言</label>
-        <input id="assert-status" class="form-input form-input-small" type="number" placeholder="状态码">
-        <input id="assert-duration" class="form-input form-input-small" type="number" min="0" placeholder="最大耗时 ms">
-        <textarea id="assert-json" class="form-textarea" placeholder="JSON 断言，每行一个，例如 $.code=0"></textarea>
-        <button id="btn-save-assertion" class="btn btn-small">保存断言</button>
+        <label class="assert-label">断言</label>
+        <input id="assert-status" class="control control-compact" type="number" placeholder="状态码">
+        <input id="assert-duration" class="control control-compact" type="number" min="0" placeholder="最大耗时 ms">
+        <button id="btn-save-assertion" class="btn btn-ghost btn-tiny">保存断言</button>
+        <textarea id="assert-json" class="control textarea" rows="2" placeholder="JSON 断言，每行一个，例如 $.code=0"></textarea>
       </div>
       <div class="detail-tabs">
         <button class="tab active" data-tab="tab-headers">Headers</button>
@@ -181,43 +239,41 @@
         <div id="tab-preview" class="tab-content"></div>
         <div id="tab-replay-result" class="tab-content">
           <div class="replay-editor">
-            <div class="form-row"><label>重放方法</label><select id="replay-method" class="form-input form-input-small"></select></div>
-            <div class="form-row"><label>请求头 (JSON)</label><textarea id="replay-headers" class="form-textarea"></textarea></div>
-            <div class="form-row"><label>请求体</label><textarea id="replay-body" class="form-textarea"></textarea></div>
+            <div class="form-row"><label for="replay-method">重放方法</label><select id="replay-method" class="control control-compact"></select></div>
+            <div class="form-row"><label for="replay-headers">请求头 (JSON)</label><textarea id="replay-headers" class="control textarea" rows="4"></textarea></div>
+            <div class="form-row"><label for="replay-body">请求体</label><textarea id="replay-body" class="control textarea" rows="4"></textarea></div>
           </div>
-          <div id="replay-output" class="no-data">点击「重放」按钮测试请求</div>
+          <div id="replay-output" class="no-data">点击「重放」测试请求，结果会显示在这里</div>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- 对比面板 -->
   <div class="detail-overlay" id="compare-overlay" style="display:none">
     <div class="detail-panel compare-panel">
       <div class="detail-header">
-        <span>请求对比</span>
+        <span class="detail-title">请求对比</span>
         <div class="detail-actions">
-          <button id="btn-close-compare" class="btn-close">✕</button>
+          <button id="btn-close-compare" class="btn-close" title="关闭" aria-label="关闭">✕</button>
         </div>
       </div>
       <div class="compare-content" id="compare-content"></div>
     </div>
   </div>
 
-  <!-- WebSocket 详情面板 -->
   <div class="detail-overlay" id="ws-detail-overlay" style="display:none">
     <div class="detail-panel ws-detail-panel">
       <div class="detail-header">
-        <span id="ws-detail-title">WebSocket 详情</span>
+        <span class="detail-title" id="ws-detail-title">WebSocket 详情</span>
         <div class="detail-actions">
-          <button id="btn-ws-export" class="btn btn-blue">📥 导出</button>
-          <button id="btn-close-ws-detail" class="btn-close">✕</button>
+          <button id="btn-ws-export" class="btn btn-ghost btn-tiny">导出</button>
+          <button id="btn-close-ws-detail" class="btn-close" title="关闭" aria-label="关闭">✕</button>
         </div>
       </div>
       <div class="ws-info" id="ws-info"></div>
       <div class="ws-replay-bar">
-        <input id="ws-send-input" class="form-input" placeholder="发送 WebSocket 消息">
-        <button id="btn-ws-send" class="btn btn-green">发送</button>
+        <input id="ws-send-input" class="control" placeholder="输入消息后发送到此连接">
+        <button id="btn-ws-send" class="btn btn-primary">发送</button>
       </div>
       <div class="ws-messages-container">
         <div class="ws-messages" id="ws-messages"></div>
@@ -225,105 +281,65 @@
     </div>
   </div>
 
-  <!-- Mock 规则编辑面板 -->
   <div class="detail-overlay" id="mock-edit-overlay" style="display:none">
     <div class="detail-panel mock-edit-panel">
       <div class="detail-header">
-        <span id="mock-edit-title">添加 Mock 规则</span>
+        <span class="detail-title" id="mock-edit-title">添加 Mock 规则</span>
         <div class="detail-actions">
-          <button id="btn-save-mock" class="btn btn-green">保存</button>
-          <button id="btn-close-mock-edit" class="btn-close">✕</button>
+          <button id="btn-save-mock" class="btn btn-primary">保存</button>
+          <button id="btn-close-mock-edit" class="btn-close" title="关闭" aria-label="关闭">✕</button>
         </div>
       </div>
       <div class="mock-edit-form">
-        <div class="form-row">
-          <label>规则名称</label>
-          <input type="text" id="mock-name" placeholder="可选" class="form-input">
+        <div class="form-row"><label for="mock-name">规则名称</label><input type="text" id="mock-name" placeholder="可选" class="control"></div>
+        <div class="form-row"><label for="mock-pattern">URL 匹配</label><input type="text" id="mock-pattern" placeholder="输入 URL 片段或正则" class="control" required></div>
+        <div class="form-row form-row-inline"><label><input type="checkbox" id="mock-is-regex"> 使用正则表达式</label></div>
+        <div class="form-grid">
+          <div class="form-row"><label for="mock-status">状态码</label><input type="number" id="mock-status" value="200" class="control"></div>
+          <div class="form-row"><label for="mock-method">HTTP 方法</label>
+            <select id="mock-method" class="control">
+              <option value="*">全部</option>
+              <option>GET</option><option>POST</option><option>PUT</option>
+              <option>PATCH</option><option>DELETE</option><option>OPTIONS</option>
+            </select>
+          </div>
+          <div class="form-row"><label for="mock-priority">优先级</label><input type="number" id="mock-priority" value="0" class="control"></div>
+          <div class="form-row"><label for="mock-action">动作</label>
+            <select id="mock-action" class="control">
+              <option value="respond">返回响应</option>
+              <option value="error">模拟网络错误</option>
+            </select>
+          </div>
         </div>
-        <div class="form-row">
-          <label>URL 匹配</label>
-          <input type="text" id="mock-pattern" placeholder="输入 URL 片段或正则" class="form-input" required>
-        </div>
-        <div class="form-row">
-          <label>
-            <input type="checkbox" id="mock-is-regex"> 使用正则表达式
-          </label>
-        </div>
-        <div class="form-row">
-          <label>状态码</label>
-          <input type="number" id="mock-status" value="200" class="form-input form-input-small">
-        </div>
-        <div class="form-row">
-          <label>HTTP 方法</label>
-          <select id="mock-method" class="form-input form-input-small">
-            <option value="*">全部</option>
-            <option>GET</option><option>POST</option><option>PUT</option>
-            <option>PATCH</option><option>DELETE</option><option>OPTIONS</option>
-          </select>
-        </div>
-        <div class="form-row">
-          <label>优先级</label>
-          <input type="number" id="mock-priority" value="0" class="form-input form-input-small">
-        </div>
-        <div class="form-row">
-          <label>动作</label>
-          <select id="mock-action" class="form-input form-input-small">
-            <option value="respond">返回响应</option>
-            <option value="error">模拟网络错误</option>
-          </select>
-        </div>
-        <div class="form-row">
-          <label>错误信息</label>
-          <input type="text" id="mock-error" value="Mock Network Error" class="form-input">
-        </div>
-        <div class="form-row">
-          <label>Query 匹配 (JSON)</label>
-          <input type="text" id="mock-match-query" value="{}" class="form-input">
-        </div>
-        <div class="form-row">
-          <label>请求头匹配 (JSON)</label>
-          <input type="text" id="mock-match-headers" value="{}" class="form-input">
-        </div>
-        <div class="form-row">
-          <label>请求体包含</label>
-          <input type="text" id="mock-match-body" class="form-input">
-        </div>
-        <div class="form-row">
-          <label>响应延迟 (ms)</label>
-          <input type="number" id="mock-delay" min="0" value="0" class="form-input form-input-small">
-        </div>
-        <div class="form-row">
-          <label>响应头 (JSON)</label>
-          <input type="text" id="mock-headers" value='{"content-type":"application/json"}' class="form-input">
-        </div>
-        <div class="form-row">
-          <label>响应体</label>
-          <textarea id="mock-body" placeholder='{"code":0,"data":{}}' class="form-textarea"></textarea>
-        </div>
+        <div class="form-row"><label for="mock-error">错误信息</label><input type="text" id="mock-error" value="Mock Network Error" class="control"></div>
+        <div class="form-row"><label for="mock-match-query">Query 匹配 (JSON)</label><input type="text" id="mock-match-query" value="{}" class="control"></div>
+        <div class="form-row"><label for="mock-match-headers">请求头匹配 (JSON)</label><input type="text" id="mock-match-headers" value="{}" class="control"></div>
+        <div class="form-row"><label for="mock-match-body">请求体包含</label><input type="text" id="mock-match-body" class="control"></div>
+        <div class="form-row"><label for="mock-delay">响应延迟 (ms)</label><input type="number" id="mock-delay" min="0" value="0" class="control"></div>
+        <div class="form-row"><label for="mock-headers">响应头 (JSON)</label><input type="text" id="mock-headers" value='{"content-type":"application/json"}' class="control"></div>
+        <div class="form-row"><label for="mock-body">响应体</label><textarea id="mock-body" placeholder='{"code":0,"data":{}}' class="control textarea" rows="5"></textarea></div>
       </div>
     </div>
   </div>
 
-  <!-- 保存过滤器面板 -->
   <div class="detail-overlay" id="save-filter-overlay" style="display:none">
     <div class="detail-panel save-filter-panel">
       <div class="detail-header">
-        <span>保存过滤器</span>
+        <span class="detail-title">保存过滤器</span>
         <div class="detail-actions">
-          <button id="btn-confirm-save-filter" class="btn btn-green">保存</button>
-          <button id="btn-close-save-filter" class="btn-close">✕</button>
+          <button id="btn-confirm-save-filter" class="btn btn-primary">保存</button>
+          <button id="btn-close-save-filter" class="btn-close" title="关闭" aria-label="关闭">✕</button>
         </div>
       </div>
       <div class="mock-edit-form">
         <div class="form-row">
-          <label>过滤器名称</label>
-          <input type="text" id="filter-name" placeholder="比如：API 错误" class="form-input" required>
+          <label for="filter-name">过滤器名称</label>
+          <input type="text" id="filter-name" placeholder="例如：接口错误、登录链路" class="control" required>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- Toast 提示 -->
   <div id="toast" class="toast" style="display:none"></div>
 
   <script src="popup.js"></script>

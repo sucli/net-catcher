@@ -114,7 +114,64 @@ function loadFilters() {
 }
 
 // 绑定事件
+function setPanelVisible(id, visible) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.hidden = !visible;
+  el.style.display = visible ? '' : 'none';
+}
+
+function updateViewVisibility() {
+  setPanelVisible('stats-bar', currentView === 'http');
+  setPanelVisible('filter-bar', currentView === 'http' || currentView === 'timeline');
+  setPanelVisible('http-col-header', currentView === 'http');
+  setPanelVisible('request-list', currentView === 'http');
+  setPanelVisible('ws-filter-bar', currentView === 'ws');
+  setPanelVisible('ws-col-header', currentView === 'ws');
+  setPanelVisible('ws-list', currentView === 'ws');
+  setPanelVisible('timeline-view', currentView === 'timeline');
+  setPanelVisible('mock-view', currentView === 'mock');
+}
+
+function bindMoreMenu() {
+  const trigger = document.getElementById('btn-more');
+  const menu = document.getElementById('more-menu');
+  if (!trigger || !menu) return;
+
+  const closeMenu = () => {
+    menu.hidden = true;
+    trigger.setAttribute('aria-expanded', 'false');
+  };
+
+  const openMenu = () => {
+    menu.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+  };
+
+  trigger.addEventListener('click', (event) => {
+    event.stopPropagation();
+    if (menu.hidden) openMenu();
+    else closeMenu();
+  });
+
+  document.addEventListener('click', (event) => {
+    if (menu.hidden) return;
+    if (!menu.contains(event.target) && event.target !== trigger) closeMenu();
+  });
+
+  menu.addEventListener('click', (event) => {
+    event.stopPropagation();
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !menu.hidden) closeMenu();
+  });
+}
+
 function bindEvents() {
+  bindMoreMenu();
+  updateViewVisibility();
+
   // 视图切换
   document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -128,17 +185,6 @@ function bindEvents() {
       else if (currentView === 'mock') renderMockRules();
     });
   });
-
-  // 更新视图可见性
-  function updateViewVisibility() {
-    document.getElementById('stats-bar').style.display = currentView === 'http' ? '' : 'none';
-    document.getElementById('filter-bar').style.display = (currentView === 'http' || currentView === 'timeline') ? '' : 'none';
-    document.getElementById('request-list').style.display = currentView === 'http' ? '' : 'none';
-    document.getElementById('ws-list').style.display = currentView === 'ws' ? '' : 'none';
-    document.getElementById('ws-filter-bar').style.display = currentView === 'ws' ? '' : 'none';
-    document.getElementById('timeline-view').style.display = currentView === 'timeline' ? '' : 'none';
-    document.getElementById('mock-view').style.display = currentView === 'mock' ? '' : 'none';
-  }
 
   // 暂停/恢复
   document.getElementById('capture-scope').addEventListener('change', e => {
@@ -496,13 +542,13 @@ function replayRequest() {
   if (!id) return;
 
   const btn = document.getElementById('btn-replay');
-  btn.textContent = '⏳ 重放中...';
+  btn.textContent = '重放中...';
   btn.disabled = true;
 
   let replayHeaders = {};
   try { replayHeaders = JSON.parse(document.getElementById('replay-headers').value || '{}'); } catch {
     document.getElementById('replay-output').innerHTML = '<div class="replay-error">请求头 JSON 格式无效</div>';
-    btn.textContent = '🔄 重放';
+    btn.textContent = '重放';
     btn.disabled = false;
     return;
   }
@@ -519,7 +565,7 @@ function replayRequest() {
     body: currentReplayBody,
   };
   chrome.runtime.sendMessage({ type: 'REPLAY_REQUEST', data: { id, options } }, (res) => {
-    btn.textContent = '🔄 重放';
+    btn.textContent = '重放';
     btn.disabled = false;
 
     // 切换到重放结果 tab
@@ -982,7 +1028,7 @@ function showDetail(id) {
     headers: document.getElementById('replay-headers').value,
     body: document.getElementById('replay-body').value,
   };
-  document.getElementById('replay-output').innerHTML = '<div class="no-data">点击「重放」按钮测试请求</div>';
+  document.getElementById('replay-output').innerHTML = '<div class="no-data">点击「重放」测试请求，结果会显示在这里</div>';
 
   // 重置 tab
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -1152,8 +1198,27 @@ function updateCounts() {
 
 function updateToggleButton() {
   const btn = document.getElementById('btn-toggle');
-  btn.textContent = isCapturing ? '⏸' : '▶';
-  btn.className = isCapturing ? 'btn btn-green' : 'btn btn-yellow';
+  const label = document.getElementById('capture-label');
+  const dot = document.getElementById('capture-dot');
+  const statusDot = document.getElementById('status-capture-dot');
+  const statusLive = document.getElementById('status-live');
+  const statusLiveText = document.getElementById('status-live-text');
+
+  if (label) label.textContent = isCapturing ? '捕获中' : '已暂停';
+  if (dot) {
+    dot.classList.toggle('live', isCapturing);
+    dot.classList.toggle('paused', !isCapturing);
+  }
+  if (statusDot) {
+    statusDot.classList.toggle('live', isCapturing);
+    statusDot.classList.toggle('paused', !isCapturing);
+  }
+  if (statusLive) statusLive.classList.toggle('paused', !isCapturing);
+  if (statusLiveText) statusLiveText.textContent = isCapturing ? '采集中' : '已暂停';
+  if (btn) {
+    btn.className = 'btn btn-ghost capture-toggle';
+    btn.title = isCapturing ? '暂停捕获' : '恢复捕获';
+  }
 }
 
 function updateStats() {
