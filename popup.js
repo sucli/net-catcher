@@ -10,7 +10,6 @@ let selectedWsId = null;
 let autoScroll = true;
 let currentView = 'http';
 let groupByDomain = false;
-let compareMode = false;
 let activeTabId = null;
 let captureScope = 'current';
 let captureSettings = { redactSensitive: true, excludedHosts: [] };
@@ -19,22 +18,53 @@ let lastStorageError = '';
 let sessions = [];
 let activeSessionId = '';
 let scenarios = [];
+let cachedWindowId = null;
+let currentRuleTab = 'mock';
+let advancedRules = {
+  rewrite: [], mapLocal: [], throttle: [], breakpoint: [], hostMap: [], script: [], pending: [],
+};
 
 // 初始化
 document.addEventListener('DOMContentLoaded', () => {
-  chrome.storage.local.get(['nc_autoScroll', 'nc_groupByDomain'], (data) => {
-    if (data.nc_autoScroll !== undefined) autoScroll = data.nc_autoScroll;
-    if (data.nc_groupByDomain !== undefined) groupByDomain = data.nc_groupByDomain;
-    document.getElementById('chk-auto-scroll').checked = autoScroll;
-    document.getElementById('btn-group-toggle').classList.toggle('active', groupByDomain);
-  });
+  try {
+    chrome.storage.local.get(['nc_autoScroll', 'nc_groupByDomain'], (data) => {
+      if (data.nc_autoScroll !== undefined) autoScroll = data.nc_autoScroll;
+      if (data.nc_groupByDomain !== undefined) groupByDomain = data.nc_groupByDomain;
+      const scrollEl = document.getElementById('chk-auto-scroll');
+      const groupEl = document.getElementById('btn-group-toggle');
+      if (scrollEl) scrollEl.checked = autoScroll;
+      if (groupEl) groupEl.classList.toggle('active', groupByDomain);
+    });
+  } catch {}
+
+  try {
     chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
       activeTabId = tabs?.[0]?.id ?? null;
+      cachedWindowId = tabs?.[0]?.windowId ?? null;
       loadRequests();
     });
-    loadFilters();
-    loadSettings();
-  bindEvents();
+  } catch {}
+
+  // 兜底缓存 windowId。注意：callback 版 getCurrent 返回 undefined，不能链 .catch
+  try {
+    if (chrome.windows?.getCurrent) {
+      const maybePromise = chrome.windows.getCurrent(win => {
+        if (Number.isInteger(win?.id)) cachedWindowId = win.id;
+      });
+      if (maybePromise && typeof maybePromise.catch === 'function') {
+        maybePromise.catch(() => {});
+      }
+    }
+  } catch {}
+
+  loadFilters();
+  loadSettings();
+
+  try {
+    bindEvents();
+  } catch (error) {
+    console.error('[NetCatcher] bindEvents failed', error);
+  }
 });
 
 // 加载请求数据
@@ -58,10 +88,15 @@ function loadRequests() {
       }
       updateToggleButton();
       updateCounts();
-      if (currentView === 'http') { renderRequests(); updateStats(); }
+      if (currentView === 'http') { renderRequests({ incremental: true }); updateStats(); }
       else if (currentView === 'ws') renderWsConnections();
       else if (currentView === 'timeline') renderTimeline();
-      else if (currentView === 'mock') renderMockRules();
+      else if (currentView === 'mock') {
+        loadAdvancedRules().then(() => {
+          if (currentRuleTab === 'mock') renderMockRules();
+          else renderAdvancedRules();
+        });
+      }
     }
   });
 }
@@ -122,6 +157,7 @@ function setPanelVisible(id, visible) {
 }
 
 function updateViewVisibility() {
+  hideHoverTooltip();
   setPanelVisible('stats-bar', currentView === 'http');
   setPanelVisible('filter-bar', currentView === 'http' || currentView === 'timeline');
   setPanelVisible('http-col-header', currentView === 'http');
@@ -168,8 +204,70 @@ function bindMoreMenu() {
   });
 }
 
+function bindSidePanelButton() {
+  const btn = document.getElementById('btn-open-sidepanel');
+  if (!btn || btn.dataset.bound === '1') return;
+  btn.dataset.bound = '1';
+
+  btn.addEventListener('click', () => {
+    // 立刻给反馈，确认点击已生效
+    showToast('正在打开侧边栏…');
+
+    if (!chrome.sidePanel || typeof chrome.sidePanel.open !== 'function') {
+      showToast('当前 Chrome 不支持 sidePanel.open，请升级浏览器');
+      return;
+    }
+
+    const report = (err) => {
+      if (err) showToast(`打开侧边栏失败：${err}`);
+      else showToast('侧边栏已打开');
+    };
+
+    const invokeOpen = (options) => {
+      try {
+        const ret = chrome.sidePanel.open(options);
+        if (ret && typeof ret.then === 'function') {
+          ret.then(() => report(null)).catch(e => report(e?.message || String(e)));
+          return;
+        }
+        // 旧版 callback API
+        chrome.sidePanel.open(options, () => {
+          const lastError = chrome.runtime.lastError;
+          report(lastError?.message || null);
+        });
+      } catch (e) {
+        report(e?.message || String(e));
+      }
+    };
+
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tab = tabs && tabs[0];
+      const windowId = (tab && Number.isInteger(tab.windowId)) ? tab.windowId : cachedWindowId;
+      if (Number.isInteger(windowId)) {
+        invokeOpen({ windowId });
+        return;
+      }
+      if (tab && Number.isInteger(tab.id)) {
+        invokeOpen({ tabId: tab.id });
+        return;
+      }
+      invokeOpen({ windowId: chrome.windows?.WINDOW_ID_CURRENT });
+    });
+  });
+}
+
 function bindEvents() {
+  // 侧栏按钮最先绑定，避免后续逻辑异常导致未注册
+  bindSidePanelButton();
   bindMoreMenu();
+  bindRequestListEvents();
+  bindContextMenu();
+  bindMockTransferEvents();
+  bindScenarioResultEvents();
+  bindAdvancedRulesUI();
+  bindStatsAndBaseline();
+  bindSessionPackage();
+  bindShortcutsHelp();
   updateViewVisibility();
 
   // 视图切换
@@ -182,7 +280,12 @@ function bindEvents() {
       if (currentView === 'http') { renderRequests(); updateStats(); }
       else if (currentView === 'ws') renderWsConnections();
       else if (currentView === 'timeline') renderTimeline();
-      else if (currentView === 'mock') renderMockRules();
+      else if (currentView === 'mock') {
+        loadAdvancedRules().then(() => {
+          if (currentRuleTab === 'mock') renderMockRules();
+          else renderAdvancedRules();
+        });
+      }
     });
   });
 
@@ -236,9 +339,7 @@ function bindEvents() {
     if (!id) { showToast('请选择测试场景'); return; }
     chrome.runtime.sendMessage({ type: 'RUN_SCENARIO', data: { id } }, res => {
       if (res?.error) { showToast(res.error); return; }
-      const results = res?.results || [];
-      const passed = results.filter(item => item.passed).length;
-      showToast(`场景完成：${passed}/${results.length} 通过`);
+      showScenarioResults(res?.results || [], res?.scenarioId);
     });
   });
   document.getElementById('btn-delete-scenario').addEventListener('click', () => {
@@ -270,23 +371,31 @@ function bindEvents() {
   });
 
   // 导出
-  document.getElementById('btn-export').addEventListener('click', () => {
+  function buildExportPayload() {
     const data = captureScope === 'current' && Number.isInteger(activeTabId) ? { tabId: activeTabId } : {};
+    if (selectedIds.size > 0) data.ids = Array.from(selectedIds);
+    return data;
+  }
+
+  document.getElementById('btn-export').addEventListener('click', () => {
+    const data = buildExportPayload();
     chrome.runtime.sendMessage({ type: 'EXPORT_HAR', data }, (res) => {
       if (res && res.har) {
+        const scope = data.ids ? `选中${data.ids.length}` : '范围';
         downloadFile(JSON.stringify(res.har, null, 2), 'application/json',
           `netcatcher-${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.har`);
-        showToast('HAR 文件已导出');
+        showToast(`HAR 已导出（${scope}）`);
       }
     });
   });
   document.getElementById('btn-export-openapi').addEventListener('click', () => {
-    const data = captureScope === 'current' && Number.isInteger(activeTabId) ? { tabId: activeTabId } : {};
+    const data = buildExportPayload();
     chrome.runtime.sendMessage({ type: 'EXPORT_OPENAPI', data }, res => {
       if (!res?.openapi) return;
+      const scope = data.ids ? `选中${data.ids.length}` : '范围';
       downloadFile(JSON.stringify(res.openapi, null, 2), 'application/json',
         `netcatcher-openapi-${new Date().toISOString().slice(0, 10)}.json`);
-      showToast('OpenAPI 已导出');
+      showToast(`OpenAPI 已导出（${scope}）`);
     });
   });
 
@@ -321,22 +430,25 @@ function bindEvents() {
   });
   document.getElementById('btn-batch-replay').addEventListener('click', () => {
     const ids = Array.from(selectedIds);
-    if (!ids.length) { showToast('请先选择请求'); return; }
+    if (!ids.length) { showToast('请先选择请求（Ctrl/⌘+点击）'); return; }
     chrome.runtime.sendMessage({ type: 'REPLAY_BATCH', data: { ids } }, res => {
       if (res?.error) { showToast(res.error); return; }
-      const failed = (res?.results || []).filter(item => item.error).length;
-      showToast(`批量重放完成，成功 ${(res?.results || []).length - failed}，失败 ${failed}`);
+      showBatchReplayResults(res?.results || []);
     });
   });
-  document.getElementById('btn-open-sidepanel').addEventListener('click', () => {
-    chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
-      const windowId = tabs?.[0]?.windowId;
-      if (!Number.isInteger(windowId) || !chrome.sidePanel?.open) {
-        showToast('当前 Chrome 不支持侧边栏');
-        return;
-      }
-      chrome.sidePanel.open({ windowId }).catch(() => showToast('无法打开侧边栏'));
-    });
+  document.getElementById('btn-close-batch-replay').addEventListener('click', () => {
+    document.getElementById('batch-replay-overlay').style.display = 'none';
+  });
+  document.getElementById('batch-replay-overlay').addEventListener('click', (e) => {
+    if (e.target === document.getElementById('batch-replay-overlay')) {
+      document.getElementById('batch-replay-overlay').style.display = 'none';
+    }
+  });
+  document.getElementById('btn-mock-from-request').addEventListener('click', () => {
+    const id = Array.from(selectedIds)[0];
+    const request = allRequests.find(r => r.id === id);
+    if (!request) { showToast('请先选择请求'); return; }
+    openMockEditorFromRequest(request);
   });
 
   // 分组切换
@@ -363,6 +475,7 @@ function bindEvents() {
       status: document.getElementById('filter-status').value,
       type: document.getElementById('filter-type').value,
       sort: document.getElementById('filter-sort').value,
+      tags: document.getElementById('filter-tags')?.value || '',
     };
     chrome.runtime.sendMessage({ type: 'SAVE_FILTER', data: { name, config } }, (res) => {
       if (res) { loadFilters(); showToast('过滤器已保存'); }
@@ -387,6 +500,9 @@ function bindEvents() {
         document.getElementById('filter-status').value = filter.config.status || '';
         document.getElementById('filter-type').value = filter.config.type || '';
         document.getElementById('filter-sort').value = filter.config.sort || 'time-desc';
+        if (document.getElementById('filter-tags')) {
+          document.getElementById('filter-tags').value = filter.config.tags || '';
+        }
         renderRequests();
         showToast(`已加载: ${filter.name}`);
       }
@@ -478,8 +594,7 @@ function bindEvents() {
     if (selectedWsId) showWsDetail(selectedWsId);
   });
 
-  // Mock 规则管理
-  document.getElementById('btn-add-mock').addEventListener('click', () => openMockEditor());
+  // Mock 规则管理（新建按钮由 bindAdvancedRulesUI 统一处理）
   document.getElementById('btn-save-mock').addEventListener('click', saveMockRule);
   document.getElementById('btn-close-mock-edit').addEventListener('click', () => {
     document.getElementById('mock-edit-overlay').style.display = 'none';
@@ -496,7 +611,7 @@ function bindEvents() {
   });
 
   // 过滤
-  ['filter-url', 'filter-method', 'filter-status', 'filter-type', 'filter-sort'].forEach(id => {
+  ['filter-url', 'filter-method', 'filter-status', 'filter-type', 'filter-sort', 'filter-tags'].forEach(id => {
     document.getElementById(id).addEventListener('input', () => {
       if (currentView === 'http') renderRequests();
       else if (currentView === 'timeline') renderTimeline();
@@ -512,7 +627,19 @@ function bindEvents() {
 
   // 键盘快捷键
   document.addEventListener('keydown', (e) => {
-    if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) {
+    const tag = document.activeElement?.tagName;
+    const typing = ['INPUT', 'TEXTAREA', 'SELECT'].includes(tag);
+    if (e.key === '?' && !typing) {
+      e.preventDefault();
+      document.getElementById('shortcuts-overlay').style.display = 'flex';
+      return;
+    }
+    if (e.key === '/' && !typing) {
+      e.preventDefault();
+      document.getElementById('filter-url')?.focus();
+      return;
+    }
+    if (!typing && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
       const visible = filterAndSortRequests(allRequests);
       const current = Array.from(selectedIds)[0];
       let index = visible.findIndex(request => request.id === current);
@@ -520,11 +647,51 @@ function bindEvents() {
       if (visible[index]) { e.preventDefault(); showDetail(visible[index].id); }
       return;
     }
+    if (!typing && e.key === 'Enter' && selectedIds.size === 1) {
+      e.preventDefault();
+      showDetail(Array.from(selectedIds)[0]);
+      return;
+    }
+    if (!typing && e.key.toLowerCase() === 'r' && selectedIds.size === 1) {
+      e.preventDefault();
+      replayRequest();
+      return;
+    }
+    if (!typing && e.key.toLowerCase() === 'c' && selectedIds.size === 1) {
+      e.preventDefault();
+      const curl = generateCurl(allRequests.find(r => r.id === Array.from(selectedIds)[0]));
+      navigator.clipboard.writeText(curl).then(() => showToast('已复制 cURL'));
+      return;
+    }
+    if (!typing && e.key.toLowerCase() === 'm') {
+      e.preventDefault();
+      document.getElementById('tab-mock')?.click();
+      return;
+    }
+    if (!typing && e.key.toLowerCase() === 't') {
+      e.preventDefault();
+      document.getElementById('tab-timeline')?.click();
+      return;
+    }
+    if (!typing && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      document.getElementById('btn-show-stats')?.click();
+      return;
+    }
     if (e.key === 'Escape') {
       if (document.getElementById('detail-overlay').style.display !== 'none') { closeDetail(); return; }
       if (document.getElementById('ws-detail-overlay').style.display !== 'none') { closeWsDetail(); return; }
       if (document.getElementById('compare-overlay').style.display !== 'none') {
         document.getElementById('compare-overlay').style.display = 'none'; return;
+      }
+      if (document.getElementById('shortcuts-overlay')?.style.display === 'flex') {
+        document.getElementById('shortcuts-overlay').style.display = 'none'; return;
+      }
+      if (document.getElementById('stats-overlay')?.style.display === 'flex') {
+        document.getElementById('stats-overlay').style.display = 'none'; return;
+      }
+      if (document.getElementById('baseline-overlay')?.style.display === 'flex') {
+        document.getElementById('baseline-overlay').style.display = 'none'; return;
       }
     }
   });
@@ -599,48 +766,146 @@ function replayRequest() {
 
 // ============ 渲染 HTTP 请求列表 ============
 
-function renderRequests() {
-  const list = document.getElementById('request-list');
-  const empty = document.getElementById('empty-state');
-  const filtered = filterAndSortRequests(allRequests);
+const EMPTY_HTTP_HTML = `
+  <div class="empty-state" id="empty-state">
+    <div class="empty-symbol" aria-hidden="true">◈</div>
+    <div class="empty-title">暂无匹配的请求</div>
+    <div class="empty-hint">1. 在页面上刷新或触发接口调用<br>2. 确认捕获未暂停（右上角「捕获中」）<br>3. 若只看当前标签页，可切到「全部标签页」</div>
+    <div class="empty-kbd">Ctrl/⌘ + 点击可多选对比 · ↑↓ 切换 · Esc 关闭</div>
+  </div>`;
 
+function requestRowHash(r) {
+  return [
+    r.method, r.type, r.url, r.status, r.statusText || '',
+    Math.round(r.duration || 0), r.size || 0,
+    r.starred ? 1 : 0, r.isMocked ? 1 : 0, r.graphql ? 1 : 0,
+    (r.tags || []).join(','),
+  ].join('|');
+}
+
+function getFilterKey() {
+  return [
+    groupByDomain,
+    captureScope,
+    document.getElementById('filter-url')?.value || '',
+    document.getElementById('filter-method')?.value || '',
+    document.getElementById('filter-status')?.value || '',
+    document.getElementById('filter-type')?.value || '',
+    document.getElementById('filter-sort')?.value || '',
+    document.getElementById('filter-tags')?.value || '',
+    document.getElementById('filter-starred')?.checked ? 1 : 0,
+  ].join('|');
+}
+
+let listFilterKey = '';
+const rowHashMap = new Map();
+
+function renderRequests(options = {}) {
+  const list = document.getElementById('request-list');
+  if (!list) return;
+  const filtered = filterAndSortRequests(allRequests);
   document.getElementById('http-count').textContent = allRequests.length;
 
   if (filtered.length === 0) {
-    list.querySelectorAll('.request-item, .request-group').forEach(el => el.remove());
-    empty.style.display = 'flex';
+    list.innerHTML = EMPTY_HTTP_HTML;
+    listFilterKey = getFilterKey() + '|empty';
+    rowHashMap.clear();
     return;
   }
 
-  empty.style.display = 'none';
+  const filterKey = getFilterKey();
+  const idOrder = filtered.map(r => r.id).join(',');
+  const canPatch = options.incremental === true
+    && !groupByDomain
+    && filterKey === listFilterKey
+    && list.querySelector('.request-item');
 
+  if (canPatch) {
+    const liveIds = new Set(filtered.map(r => r.id));
+    list.querySelectorAll('.request-item').forEach(el => {
+      const id = parseInt(el.dataset.id, 10);
+      if (!liveIds.has(id)) {
+        el.remove();
+        rowHashMap.delete(id);
+      }
+    });
+
+    const currentOrder = Array.from(list.querySelectorAll('.request-item')).map(el => parseInt(el.dataset.id, 10));
+    if (currentOrder.join(',') === idOrder) {
+      filtered.forEach(r => {
+        const hash = requestRowHash(r);
+        if (rowHashMap.get(r.id) === hash) return;
+        const el = list.querySelector(`.request-item[data-id="${r.id}"]`);
+        if (!el) return;
+        const tmp = document.createElement('div');
+        tmp.innerHTML = renderRequestRow(r);
+        const next = tmp.firstElementChild;
+        if (next) {
+          el.replaceWith(next);
+          rowHashMap.set(r.id, hash);
+        }
+      });
+      refreshTagOptions();
+      if (autoScroll) requestAnimationFrame(() => { list.scrollTop = list.scrollHeight; });
+      return;
+    }
+  }
+
+  listFilterKey = filterKey;
+  rowHashMap.clear();
   if (groupByDomain) {
     renderGroupedRequests(list, filtered);
   } else {
     renderFlatRequests(list, filtered);
+    filtered.forEach(r => rowHashMap.set(r.id, requestRowHash(r)));
   }
-
+  refreshTagOptions();
   if (autoScroll) {
     requestAnimationFrame(() => { list.scrollTop = list.scrollHeight; });
   }
 }
 
-function renderFlatRequests(list, requests) {
-  const html = requests.map(r => {
-    const selected = selectedIds.has(r.id) ? ' selected' : '';
-    const starred = r.starred ? ' ⭐' : '';
-    const mocked = r.isMocked ? ' 🎭' : '';
-    return `<div class="request-item${selected}" data-id="${r.id}">
-      <span class="req-method ${getMethodClass(r.method)}">${escapeHtml(r.method)}</span>
-      <span class="req-url" title="${escapeHtml(r.url)}">${escapeHtml(getShortUrl(r.url))}${starred}${mocked}</span>
-      <span class="req-status ${r.status ? getStatusClass(r.status) : 'status-0'}">${r.status || '---'}</span>
-      <span class="req-duration">${r.duration ? Math.round(r.duration) + 'ms' : '...'}</span>
-      <span class="req-size">${r.size ? formatSize(r.size) : '...'}</span>
-    </div>`;
-  }).join('');
+function getTypeInfo(type) {
+  const map = {
+    fetch: { label: 'FETCH', cls: 'type-fetch' },
+    xhr: { label: 'XHR', cls: 'type-xhr' },
+    eventsource: { label: 'SSE', cls: 'type-sse' },
+    beacon: { label: 'BEACON', cls: 'type-beacon' },
+    network: { label: 'NET', cls: 'type-network' },
+    curl: { label: 'CURL', cls: 'type-curl' },
+  };
+  return map[type] || { label: String(type || 'OTHER').slice(0, 6).toUpperCase(), cls: 'type-other' };
+}
 
-  list.innerHTML = html;
-  bindRequestClicks(list);
+function renderTypeBadge(type) {
+  const info = getTypeInfo(type);
+  return `<span class="req-type ${info.cls}" title="${escapeHtml(info.label)}">${info.label}</span>`;
+}
+
+function renderRequestFlags(r) {
+  const flags = [];
+  if (r.starred) flags.push('<span class="flag-chip flag-star" title="已收藏">★</span>');
+  if (r.isMocked) flags.push('<span class="flag-chip flag-mock" title="Mock 响应">MOCK</span>');
+  if (r.graphql) flags.push('<span class="flag-chip flag-gql" title="GraphQL">GQL</span>');
+  if (!flags.length) return '';
+  return `<span class="req-flags">${flags.join('')}</span>`;
+}
+
+function renderRequestRow(r, options = {}) {
+  const selected = selectedIds.has(r.id) ? ' selected' : '';
+  const showSize = options.showSize !== false;
+  return `<div class="request-item${selected}" data-id="${r.id}">
+    <span class="req-method ${getMethodClass(r.method)}">${escapeHtml(r.method)}</span>
+    ${renderTypeBadge(r.type)}
+    <span class="req-url" title="${escapeHtml(r.url)}">${escapeHtml(getShortUrl(r.url))}${renderRequestFlags(r)}</span>
+    <span class="req-status ${r.status ? getStatusClass(r.status) : 'status-0'}">${r.status || '---'}</span>
+    <span class="req-duration">${r.duration ? Math.round(r.duration) + 'ms' : '...'}</span>
+    ${showSize ? `<span class="req-size">${r.size ? formatSize(r.size) : '...'}</span>` : ''}
+  </div>`;
+}
+
+function renderFlatRequests(list, requests) {
+  list.innerHTML = requests.map(r => renderRequestRow(r)).join('');
 }
 
 function renderGroupedRequests(list, requests) {
@@ -666,96 +931,234 @@ function renderGroupedRequests(list, requests) {
       </div>
       <div class="group-items" style="display:none">`;
     items.forEach(r => {
-      const selected = selectedIds.has(r.id) ? ' selected' : '';
-      html += `<div class="request-item${selected}" data-id="${r.id}">
-        <span class="req-method ${getMethodClass(r.method)}">${escapeHtml(r.method)}</span>
-        <span class="req-url" title="${escapeHtml(r.url)}">${escapeHtml(getShortUrl(r.url))}</span>
-        <span class="req-status ${r.status ? getStatusClass(r.status) : 'status-0'}">${r.status || '---'}</span>
-        <span class="req-duration">${r.duration ? Math.round(r.duration) + 'ms' : '...'}</span>
-      </div>`;
+      html += renderRequestRow(r);
     });
     html += '</div></div>';
   });
 
   list.innerHTML = html;
 
-  // 分组折叠
-  list.querySelectorAll('.group-header').forEach(header => {
-    header.addEventListener('click', () => {
-      const items = header.nextElementSibling;
-      const toggle = header.querySelector('.group-toggle');
-      const isOpen = items.style.display !== 'none';
-      items.style.display = isOpen ? 'none' : 'block';
-      toggle.textContent = isOpen ? '▶' : '▼';
-    });
-  });
-
-  bindRequestClicks(list);
+  // 分组折叠由事件委托处理
 }
 
-function bindRequestClicks(list) {
-  list.querySelectorAll('.request-item').forEach(item => {
-    item.addEventListener('click', (e) => {
-      const id = parseInt(item.dataset.id);
+function findRequestById(id) {
+  return allRequests.find(r => r.id === id);
+}
 
-      if (e.ctrlKey || e.metaKey) {
-        // 多选模式
-        if (selectedIds.has(id)) selectedIds.delete(id);
-        else selectedIds.add(id);
-        item.classList.toggle('selected');
+function getRequestTooltipExtras(request) {
+  const extras = [];
+  if (request.graphql?.operationName) extras.push(['GraphQL', escapeHtml(request.graphql.operationName)]);
+  if (request.tags?.length) extras.push(['标签', escapeHtml(request.tags.join(', '))]);
+  if (request.isMocked) extras.push(['Mock', '已拦截', 'status-3xx']);
+  return extras;
+}
 
-        // 选中 2 个时显示对比按钮
-        if (selectedIds.size === 2) {
-          showCompare();
-        }
-      } else {
-        // 单选
-        selectedIds.clear();
-        selectedIds.add(id);
-        list.querySelectorAll('.request-item').forEach(i => i.classList.remove('selected'));
-        item.classList.add('selected');
-        showDetail(id);
-      }
-    });
+function onRequestListClick(e) {
+  const header = e.target.closest('.group-header');
+  if (header) {
+    const items = header.nextElementSibling;
+    const toggle = header.querySelector('.group-toggle');
+    if (!items || !toggle) return;
+    const isOpen = items.style.display !== 'none';
+    items.style.display = isOpen ? 'none' : 'block';
+    toggle.textContent = isOpen ? '▶' : '▼';
+    return;
+  }
+
+  const item = e.target.closest('.request-item');
+  if (!item) return;
+  const id = parseInt(item.dataset.id, 10);
+  hideHoverTooltip();
+  hideContextMenu();
+
+  if (e.ctrlKey || e.metaKey) {
+    if (selectedIds.has(id)) selectedIds.delete(id);
+    else selectedIds.add(id);
+    item.classList.toggle('selected');
+    if (selectedIds.size >= 2) showCompare();
+    return;
+  }
+
+  selectedIds.clear();
+  selectedIds.add(id);
+  document.querySelectorAll('#request-list .request-item').forEach(i => i.classList.remove('selected'));
+  item.classList.add('selected');
+  showDetail(id);
+}
+
+function onRequestListMouseOver(e) {
+  const item = e.target.closest('.request-item');
+  if (!item) {
+    if (!e.relatedTarget || !e.relatedTarget.closest?.('.request-item')) hideHoverTooltip();
+    return;
+  }
+  if (item === onRequestListMouseOver._last) return;
+  onRequestListMouseOver._last = item;
+  const request = findRequestById(parseInt(item.dataset.id, 10));
+  if (request) scheduleRequestRowTooltip(request, e, getRequestTooltipExtras(request));
+}
+
+function onRequestListMouseMove(e) {
+  const item = e.target.closest('.request-item');
+  if (!item || document.getElementById('hover-tooltip')?.hidden) return;
+  positionHoverTooltip(e);
+}
+
+function onRequestListMouseOut(e) {
+  const from = e.target.closest?.('.request-item');
+  const to = e.relatedTarget?.closest?.('.request-item');
+  if (from && from !== to) {
+    onRequestListMouseOver._last = null;
+    hideHoverTooltip();
+  }
+}
+
+function bindRequestListEvents() {
+  const list = document.getElementById('request-list');
+  if (!list || list.dataset.bound === '1') return;
+  list.dataset.bound = '1';
+  list.addEventListener('click', onRequestListClick);
+  list.addEventListener('mouseover', onRequestListMouseOver);
+  list.addEventListener('mousemove', onRequestListMouseMove);
+  list.addEventListener('mouseout', onRequestListMouseOut);
+  list.addEventListener('contextmenu', (e) => {
+    const item = e.target.closest('.request-item');
+    if (!item) return;
+    e.preventDefault();
+    openRequestContextMenu(parseInt(item.dataset.id, 10), e.clientX, e.clientY);
   });
 }
 
 // ============ 请求对比 ============
 
+let compareTab = 'overview';
+
+function flattenJsonPaths(value, prefix = '', out = {}) {
+  if (value === null || typeof value !== 'object') {
+    out[prefix || '$'] = value;
+    return out;
+  }
+  const entries = Array.isArray(value) ? value.map((v, i) => [i, v]) : Object.entries(value);
+  if (!entries.length) {
+    out[prefix || '$'] = Array.isArray(value) ? [] : {};
+    return out;
+  }
+  entries.forEach(([k, v]) => {
+    flattenJsonPaths(v, prefix ? `${prefix}.${k}` : String(k), out);
+  });
+  return out;
+}
+
+function parseJsonSafe(text) {
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+function buildHeaderDiff(r1, r2) {
+  const keys = new Set([
+    ...Object.keys(r1.requestHeaders || {}),
+    ...Object.keys(r2.requestHeaders || {}),
+    ...Object.keys(r1.responseHeaders || {}),
+    ...Object.keys(r2.responseHeaders || {}),
+  ]);
+  const rows = [];
+  keys.forEach(k => {
+    const aReq = r1.requestHeaders?.[k];
+    const bReq = r2.requestHeaders?.[k];
+    const aRes = r1.responseHeaders?.[k];
+    const bRes = r2.responseHeaders?.[k];
+    const reqChanged = String(aReq ?? '') !== String(bReq ?? '');
+    const resChanged = String(aRes ?? '') !== String(bRes ?? '');
+    if (!reqChanged && !resChanged) return;
+    rows.push(`<tr>
+      <td>${escapeHtml(k)}</td>
+      <td>REQ ${escapeHtml(aReq ?? '—')} → ${escapeHtml(bReq ?? '—')}</td>
+      <td>RES ${escapeHtml(aRes ?? '—')} → ${escapeHtml(bRes ?? '—')}</td>
+    </tr>`);
+  });
+  if (!rows.length) return '<div class="no-data">Headers 无差异</div>';
+  return `<table class="header-table"><tr><td>Header</td><td>请求</td><td>响应</td></tr>${rows.join('')}</table>`;
+}
+
+function buildJsonPathDiff(r1, r2) {
+  const j1 = parseJsonSafe(r1.responseBody);
+  const j2 = parseJsonSafe(r2.responseBody);
+  if (!j1 || !j2) return '<div class="no-data">响应体不是合法 JSON，无法做路径对比</div>';
+  const f1 = flattenJsonPaths(j1);
+  const f2 = flattenJsonPaths(j2);
+  const keys = Array.from(new Set([...Object.keys(f1), ...Object.keys(f2)])).sort();
+  const rows = [];
+  keys.forEach(k => {
+    const x = f1[k];
+    const y = f2[k];
+    const sx = x === undefined ? '∅' : JSON.stringify(x);
+    const sy = y === undefined ? '∅' : JSON.stringify(y);
+    if (sx === sy) return;
+    rows.push(`<tr><td>${escapeHtml(k)}</td><td colspan="2">${escapeHtml(sx)} → ${escapeHtml(sy)}</td></tr>`);
+  });
+  if (!rows.length) return '<div class="no-data">JSON 路径无差异</div>';
+  return `<table class="header-table"><tr><td>路径</td><td colspan="2">变化</td></tr>${rows.join('')}</table>`;
+}
+
 function showCompare() {
   const ids = Array.from(selectedIds);
-  const r1 = allRequests.find(r => r.id === ids[0]);
-  const r2 = allRequests.find(r => r.id === ids[1]);
-  if (!r1 || !r2) return;
+  const items = ids.map(id => allRequests.find(r => r.id === id)).filter(Boolean);
+  if (items.length < 2) return;
+  const r1 = items[0];
+  const r2 = items[1];
 
-  let html = '<div class="compare-grid">';
-  html += '<div class="compare-col"><div class="compare-col-header">请求 1</div>';
-  html += buildCompareCard(r1);
-  html += '</div>';
-  html += '<div class="compare-col"><div class="compare-col-header">请求 2</div>';
-  html += buildCompareCard(r2);
-  html += '</div>';
+  const tabs = [
+    ['overview', '概览'],
+    ['headers', 'Headers'],
+    ['json', 'JSON 路径'],
+    ['text', '文本 Diff'],
+  ];
 
-  // 差异对比
-  html += '<div class="compare-diff">';
-  html += '<div class="header-section-title">主要差异</div>';
-  html += '<table class="header-table">';
-  html += `<tr><td>URL</td><td>${r1.url !== r2.url ? '❌ 不同' : '✅ 相同'}</td></tr>`;
-  html += `<tr><td>方法</td><td>${r1.method !== r2.method ? '❌ 不同' : '✅ 相同'}</td></tr>`;
-  html += `<tr><td>状态码</td><td>${r1.status !== r2.status ? '❌ 不同 (' + r1.status + ' vs ' + r2.status + ')' : '✅ 相同'}</td></tr>`;
-  html += `<tr><td>耗时</td><td>${Math.round(r1.duration || 0)}ms vs ${Math.round(r2.duration || 0)}ms</td></tr>`;
-  html += `<tr><td>大小</td><td>${formatSize(r1.size || 0)} vs ${formatSize(r2.size || 0)}</td></tr>`;
-  html += '</table>';
-
-  // Body diff
-  if (r1.responseBody && r2.responseBody) {
-    html += '<div class="header-section-title">响应体差异</div>';
-    html += `<div class="diff-content">${generateDiff(r1.responseBody, r2.responseBody)}</div>`;
+  let body = '';
+  if (compareTab === 'headers') body = buildHeaderDiff(r1, r2);
+  else if (compareTab === 'json') body = buildJsonPathDiff(r1, r2);
+  else if (compareTab === 'text') {
+    body = (r1.responseBody && r2.responseBody)
+      ? `<div class="diff-content">${generateDiff(r1.responseBody, r2.responseBody)}</div>`
+      : '<div class="no-data">缺少响应体</div>';
+  } else {
+    body = `
+      <div class="compare-cards">
+        <div class="compare-col">
+          <div class="compare-col-header">请求 A · ${escapeHtml(r1.method)} ${r1.status || '---'}</div>
+          ${buildCompareCard(r1)}
+        </div>
+        <div class="compare-col">
+          <div class="compare-col-header">请求 B · ${escapeHtml(r2.method)} ${r2.status || '---'}</div>
+          ${buildCompareCard(r2)}
+        </div>
+      </div>
+      <div class="compare-extra">已选 ${items.length} 条，当前对比前两条</div>
+      <div class="header-section-title">主要差异</div>
+      <table class="header-table">
+        <tr><td>URL</td><td>${r1.url !== r2.url ? '不同' : '相同'}</td></tr>
+        <tr><td>方法</td><td>${r1.method !== r2.method ? '不同' : '相同'}</td></tr>
+        <tr><td>状态码</td><td>${r1.status !== r2.status ? `${r1.status || '---'} vs ${r2.status || '---'}` : '相同'}</td></tr>
+        <tr><td>耗时</td><td>${Math.round(r1.duration || 0)}ms vs ${Math.round(r2.duration || 0)}ms</td></tr>
+        <tr><td>大小</td><td>${formatSize(r1.size || 0)} vs ${formatSize(r2.size || 0)}</td></tr>
+      </table>`;
   }
-  html += '</div>';
 
-  html += '</div>';
-  document.getElementById('compare-content').innerHTML = html;
+  document.getElementById('compare-content').innerHTML = `
+    <div class="compare-toolbar">
+      <div class="compare-tabs">
+        ${tabs.map(([key, label]) => `<button class="compare-tab ${compareTab === key ? 'active' : ''}" data-ctab="${key}">${label}</button>`).join('')}
+      </div>
+      <div class="compare-meta">已选 ${items.length} 条</div>
+    </div>
+    <div class="compare-body">${body}</div>`;
+
+  document.querySelectorAll('#compare-content .compare-tab').forEach(btn => {
+    btn.addEventListener('click', () => {
+      compareTab = btn.dataset.ctab;
+      showCompare();
+    });
+  });
+
   document.getElementById('compare-overlay').style.display = 'flex';
 }
 
@@ -788,20 +1191,198 @@ function generateDiff(text1, text2) {
   return html;
 }
 
+// ============ 悬停摘要 ============
+
+let hoverTipTimer = null;
+
+function hideHoverTooltip() {
+  const tip = document.getElementById('hover-tooltip');
+  if (tip) tip.hidden = true;
+  if (hoverTipTimer) {
+    clearTimeout(hoverTipTimer);
+    hoverTipTimer = null;
+  }
+}
+
+// 保持旧名，避免散落调用遗漏
+const hideTimelineTooltip = hideHoverTooltip;
+
+function positionHoverTooltip(event) {
+  const tip = document.getElementById('hover-tooltip');
+  if (!tip) return;
+  const pad = 12;
+  const box = tip.getBoundingClientRect();
+  let x = event.clientX + 14;
+  let y = event.clientY + 14;
+  if (x + box.width > window.innerWidth - pad) x = event.clientX - box.width - 14;
+  if (y + box.height > window.innerHeight - pad) y = event.clientY - box.height - 14;
+  tip.style.left = `${Math.max(pad, x)}px`;
+  tip.style.top = `${Math.max(pad, y)}px`;
+}
+
+function showHoverTooltip(html, event) {
+  const tip = document.getElementById('hover-tooltip');
+  if (!tip) return;
+  tip.innerHTML = html;
+  tip.hidden = false;
+  positionHoverTooltip(event);
+}
+
+function buildRequestTooltipRows(r, extras = []) {
+  const statusClass = r.status ? getStatusClass(r.status) : 'status-0';
+  const rows = [
+    `<span class="tt-key">状态</span><span class="tt-val ${statusClass}">${r.status || '---'} ${escapeHtml(r.statusText || '')}</span>`,
+    `<span class="tt-key">耗时</span><span class="tt-val">${r.duration ? Math.round(r.duration) + 'ms' : '...'}</span>`,
+    `<span class="tt-key">大小</span><span class="tt-val">${r.size ? formatSize(r.size) : '...'}</span>`,
+    `<span class="tt-key">类型</span><span class="tt-val">${escapeHtml(getTypeInfo(r.type).label)}</span>`,
+  ];
+  extras.forEach(([key, val, cls = '']) => {
+    rows.push(`<span class="tt-key">${escapeHtml(key)}</span><span class="tt-val ${cls}">${val}</span>`);
+  });
+  return `
+    <div class="tt-title">${escapeHtml(r.method)} ${escapeHtml(getShortUrl(r.url))}</div>
+    <div class="tt-grid">${rows.join('')}</div>`;
+}
+
+function showRequestRowTooltip(r, event, extras) {
+  if (!r || document.getElementById('detail-overlay')?.style.display === 'flex') return;
+  showHoverTooltip(buildRequestTooltipRows(r, extras), event);
+}
+
+function scheduleRequestRowTooltip(r, event, extras) {
+  if (hoverTipTimer) clearTimeout(hoverTipTimer);
+  hoverTipTimer = setTimeout(() => showRequestRowTooltip(r, event, extras), 120);
+}
+
 // ============ 时间线视图 ============
+
+function analyzeTimelineRequests(requests) {
+  const items = requests.map(r => ({
+    id: r.id,
+    start: r.startTime,
+    end: r.endTime,
+    duration: Math.max(0, (r.endTime || r.startTime) - r.startTime),
+    request: r,
+    concurrentIds: new Set(),
+  })).sort((a, b) => a.start - b.start || a.end - b.end);
+
+  for (let i = 0; i < items.length; i++) {
+    for (let j = i + 1; j < items.length; j++) {
+      const a = items[i];
+      const b = items[j];
+      if (b.start >= a.end) break;
+      a.concurrentIds.add(b.id);
+      b.concurrentIds.add(a.id);
+    }
+  }
+
+  // 关键路径：按开始时间推进，优先延长“水位线”的请求
+  let frontier = items.length ? items[0].start : 0;
+  items.forEach(item => {
+    item.isCritical = item.start >= frontier - 1;
+    if (item.isCritical) frontier = Math.max(frontier, item.end);
+  });
+
+  let longest = items[0] || null;
+  items.forEach(item => {
+    if (!longest || item.duration > longest.duration) longest = item;
+  });
+
+  items.forEach(item => {
+    item.isSerial = item.concurrentIds.size === 0;
+    item.isLongest = !!longest && item.id === longest.id;
+  });
+
+  let peakConcurrent = 0;
+  const events = [];
+  items.forEach(item => {
+    events.push({ t: item.start, delta: 1 });
+    events.push({ t: item.end, delta: -1 });
+  });
+  events.sort((a, b) => a.t - b.t || a.delta - b.delta);
+  let depth = 0;
+  events.forEach(ev => {
+    depth += ev.delta;
+    peakConcurrent = Math.max(peakConcurrent, depth);
+  });
+
+  return {
+    items,
+    byId: new Map(items.map(item => [item.id, item])),
+    peakConcurrent,
+    serialCount: items.filter(item => item.isSerial).length,
+    criticalCount: items.filter(item => item.isCritical).length,
+    longest,
+  };
+}
+
+function renderTimelineSummary(analysis, totalDuration) {
+  const summary = document.getElementById('timeline-summary');
+  if (!summary) return;
+  const longest = analysis.longest;
+  summary.innerHTML = `
+    <span class="stat"><b>${Math.round(totalDuration)}ms</b><span>总时长</span></span>
+    <span class="stat ok"><b>${analysis.peakConcurrent}</b><span>峰值并发</span></span>
+    <span class="stat warn"><b>${analysis.serialCount}</b><span>串行</span></span>
+    <span class="stat"><b>${analysis.criticalCount}</b><span>关键路径</span></span>
+    <span class="stat time"><span>最长</span><b>${longest ? Math.round(longest.duration) + 'ms' : '-'}</b></span>
+    <span class="timeline-legend">
+      <span class="legend-item"><i class="legend-swatch critical"></i>关键路径</span>
+      <span class="legend-item"><i class="legend-swatch serial"></i>串行</span>
+      <span class="legend-item"><i class="legend-swatch longest"></i>最长</span>
+    </span>`;
+}
+
+function highlightTimelineConcurrency(analysis, focusId) {
+  const container = document.getElementById('timeline-container');
+  if (!container) return;
+  const focus = analysis.byId.get(focusId);
+  container.querySelectorAll('.timeline-row').forEach(row => {
+    const id = parseInt(row.dataset.id, 10);
+    row.classList.remove('is-focus', 'is-concurrent', 'is-dimmed');
+    if (!focus) return;
+    if (id === focusId) {
+      row.classList.add('is-focus');
+      return;
+    }
+    if (focus.concurrentIds.has(id)) row.classList.add('is-concurrent');
+    else row.classList.add('is-dimmed');
+  });
+}
+
+function clearTimelineConcurrencyHighlight() {
+  const container = document.getElementById('timeline-container');
+  if (!container) return;
+  container.querySelectorAll('.timeline-row').forEach(row => {
+    row.classList.remove('is-focus', 'is-concurrent', 'is-dimmed');
+  });
+}
+
+function showTimelineTooltip(r, event, extras) {
+  if (!r || document.getElementById('detail-overlay')?.style.display === 'flex') return;
+  showHoverTooltip(buildRequestTooltipRows(r, extras), event);
+}
 
 function renderTimeline() {
   const filtered = filterAndSortRequests(allRequests).filter(r => r.endTime);
   const container = document.getElementById('timeline-container');
+  const summary = document.getElementById('timeline-summary');
+  hideHoverTooltip();
 
   if (filtered.length === 0) {
-    container.innerHTML = '<div class="empty-state"><div class="empty-icon">📊</div><div>暂无已完成的请求</div><div class="empty-hint">等待请求完成或刷新页面</div></div>';
+    if (summary) summary.innerHTML = '';
+    container.innerHTML = '<div class="empty-state"><div class="empty-symbol" aria-hidden="true">≡</div><div class="empty-title">暂无已完成的请求</div><div class="empty-hint">等待请求完成或刷新页面后查看瀑布图</div></div>';
     return;
   }
 
   const minTime = Math.min(...filtered.map(r => r.startTime));
   const maxTime = Math.max(...filtered.map(r => r.endTime));
   const totalDuration = maxTime - minTime || 1;
+  const analysis = analyzeTimelineRequests(filtered);
+  renderTimelineSummary(analysis, totalDuration);
+
+  const tip = document.getElementById('hover-tooltip');
+  if (tip) tip.dataset.minTime = String(minTime);
 
   let html = '<div class="timeline-header">';
   html += `<span class="timeline-label">0ms</span>`;
@@ -809,18 +1390,25 @@ function renderTimeline() {
   html += '</div>';
   html += '<div class="timeline-rows">';
 
-  filtered.forEach((r, idx) => {
+  filtered.forEach((r) => {
     const startPct = ((r.startTime - minTime) / totalDuration) * 100;
     const widthPct = r.duration ? Math.max(((r.duration) / totalDuration) * 100, 1) : 2;
     const statusClass = r.status ? getStatusClass(r.status) : 'status-0';
     const shortUrl = getShortUrl(r.url);
+    const typeInfo = getTypeInfo(r.type);
+    const meta = analysis.byId.get(r.id);
+    const rowClasses = ['timeline-row'];
+    if (meta?.isCritical) rowClasses.push('is-critical');
+    if (meta?.isSerial) rowClasses.push('is-serial');
+    if (meta?.isLongest) rowClasses.push('is-longest');
+    const metaLabel = meta?.isSerial ? '串行' : typeInfo.label;
 
-    const title = `${r.method} ${r.url}\n${r.status || '---'} | ${r.duration ? Math.round(r.duration) + 'ms' : '...'}`;
-    html += `<div class="timeline-row" data-id="${r.id}" title="${escapeHtml(title)}">
-      <div class="timeline-label">${escapeHtml(shortUrl.slice(0, 30))}</div>
+    html += `<div class="${rowClasses.join(' ')}" data-id="${r.id}">
+      <div class="timeline-label" title="${escapeHtml(r.url)}">${escapeHtml(shortUrl.slice(0, 26))}</div>
       <div class="timeline-bar-container">
         <div class="timeline-bar ${statusClass}" style="left:${startPct}%;width:${widthPct}%"></div>
       </div>
+      <div class="timeline-meta">${metaLabel}</div>
     </div>`;
   });
 
@@ -828,8 +1416,36 @@ function renderTimeline() {
   container.innerHTML = html;
 
   container.querySelectorAll('.timeline-row').forEach(row => {
+    const request = filtered.find(r => r.id === parseInt(row.dataset.id, 10));
+    const meta = analysis.byId.get(request?.id);
+    const extras = [];
+    if (meta) {
+      const offset = Math.max(0, Math.round(request.startTime - minTime));
+      extras.push(['偏移', `+${offset}ms`]);
+      extras.push([
+        '并行',
+        meta.isSerial ? '无（串行）' : `${meta.concurrentIds.size} 个`,
+        meta.isSerial ? '' : 'status-2xx',
+      ]);
+      if (meta.isCritical) extras.push(['路径', '关键路径', 'status-2xx']);
+      if (meta.isLongest) extras.push(['标记', '本段最长', 'status-3xx']);
+    }
+
+    row.addEventListener('mouseenter', (event) => {
+      highlightTimelineConcurrency(analysis, request.id);
+      showTimelineTooltip(request, event, extras);
+    });
+    row.addEventListener('mousemove', (event) => {
+      showTimelineTooltip(request, event, extras);
+    });
+    row.addEventListener('mouseleave', () => {
+      clearTimelineConcurrencyHighlight();
+      hideHoverTooltip();
+    });
     row.addEventListener('click', () => {
-      const id = parseInt(row.dataset.id);
+      clearTimelineConcurrencyHighlight();
+      hideHoverTooltip();
+      const id = parseInt(row.dataset.id, 10);
       selectedIds.clear();
       selectedIds.add(id);
       showDetail(id);
@@ -842,7 +1458,7 @@ function renderTimeline() {
 function renderMockRules() {
   const list = document.getElementById('mock-list');
   if (mockRules.length === 0) {
-    list.innerHTML = '<div class="empty-state"><div class="empty-icon">🎭</div><div>暂无 Mock 规则</div><div class="empty-hint">点击上方按钮添加规则</div></div>';
+    list.innerHTML = '<div class="empty-state"><div class="empty-symbol" aria-hidden="true">◎</div><div class="empty-title">暂无 Mock 规则</div><div class="empty-hint">点击「新建规则」拦截匹配请求并返回自定义响应</div></div>';
     return;
   }
 
@@ -885,6 +1501,605 @@ function renderMockRules() {
         showToast('规则已删除');
       });
     });
+  });
+}
+
+function refreshTagOptions() {
+  const datalist = document.getElementById('tag-options');
+  if (!datalist) return;
+  const tags = new Set();
+  allRequests.forEach(r => (r.tags || []).forEach(tag => tags.add(tag)));
+  datalist.innerHTML = Array.from(tags).sort().map(tag => `<option value="${escapeHtml(tag)}"></option>`).join('');
+}
+
+function openMockEditorFromRequest(request) {
+  let path = request.url;
+  try {
+    const u = new URL(request.url);
+    path = u.pathname;
+  } catch {}
+  openMockEditor({
+    name: `Mock ${request.method} ${getShortUrl(request.url)}`,
+    pattern: path,
+    isRegex: false,
+    method: request.method,
+    status: request.status && request.status >= 200 && request.status < 300 ? request.status : 200,
+    priority: 10,
+    action: 'respond',
+    delay: 0,
+    headers: request.responseHeaders || { 'content-type': 'application/json' },
+    body: request.responseBody || '{"code":0,"data":{}}',
+    matchQuery: {},
+    matchHeaders: {},
+    matchBody: '',
+    error: 'Mock Network Error',
+  });
+  document.getElementById('mock-edit-title').textContent = '从当前请求创建 Mock';
+  showToast('已按当前请求预填 Mock，请确认后保存');
+}
+
+function showBatchReplayResults(results) {
+  const failed = results.filter(item => item.error).length;
+  const passed = results.length - failed;
+  let html = `<div class="batch-summary">
+    <span class="stat ok"><b>${passed}</b><span>成功</span></span>
+    <span class="stat err"><b>${failed}</b><span>失败</span></span>
+    <span class="stat"><b>${results.length}</b><span>合计</span></span>
+  </div>`;
+  html += results.map(item => {
+    const statusClass = item.error ? 'status-0' : getStatusClass(item.status);
+    const statusText = item.error ? '失败' : (item.status || '---');
+    return `<div class="batch-item">
+      <span class="batch-status ${statusClass}">${statusText}</span>
+      <span class="batch-url" title="${escapeHtml(item.url || '')}">${escapeHtml(getShortUrl(item.url || ''))}</span>
+      <span class="batch-detail">${item.error ? escapeHtml(item.error) : escapeHtml(item.statusText || '')}</span>
+    </div>`;
+  }).join('') || '<div class="no-data">没有可展示的结果</div>';
+  document.getElementById('batch-replay-content').innerHTML = html;
+  document.getElementById('batch-replay-overlay').style.display = 'flex';
+  showToast(`批量重放完成：成功 ${passed}，失败 ${failed}`);
+}
+
+// ============ 请求右键菜单 ============
+
+function hideContextMenu() {
+  const menu = document.getElementById('context-menu');
+  if (menu) menu.hidden = true;
+}
+
+function bindContextMenu() {
+  const menu = document.getElementById('context-menu');
+  if (!menu) return;
+  document.addEventListener('click', (e) => {
+    if (!menu.contains(e.target)) hideContextMenu();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') hideContextMenu();
+  });
+  window.addEventListener('blur', hideContextMenu);
+}
+
+function openRequestContextMenu(id, x, y) {
+  const request = findRequestById(id);
+  const menu = document.getElementById('context-menu');
+  if (!request || !menu) return;
+
+  if (!selectedIds.has(id)) {
+    selectedIds.clear();
+    selectedIds.add(id);
+    document.querySelectorAll('#request-list .request-item').forEach(i => {
+      i.classList.toggle('selected', parseInt(i.dataset.id, 10) === id);
+    });
+  }
+
+  let domain = '';
+  try { domain = new URL(request.url).hostname; } catch {}
+
+  menu.innerHTML = `
+    <button data-act="detail">打开详情</button>
+    <button data-act="curl">复制 cURL</button>
+    <button data-act="url">复制 URL</button>
+    <button data-act="star">${request.starred ? '取消收藏' : '收藏'}</button>
+    <button data-act="mock">Mock 此请求</button>
+    <button data-act="filter-domain" ${domain ? '' : 'disabled'}>过滤同域名${domain ? `（${escapeHtml(domain)}）` : ''}</button>
+    <button data-act="toggle-select">多选 / 取消多选</button>
+    <button data-act="compare">对比所选（≥2）</button>
+  `;
+
+  menu.hidden = false;
+  const pad = 8;
+  const rect = menu.getBoundingClientRect();
+  const left = Math.min(x, window.innerWidth - rect.width - pad);
+  const top = Math.min(y, window.innerHeight - rect.height - pad);
+  menu.style.left = `${Math.max(pad, left)}px`;
+  menu.style.top = `${Math.max(pad, top)}px`;
+
+  menu.onclick = (e) => {
+    const btn = e.target.closest('button[data-act]');
+    if (!btn) return;
+    const act = btn.dataset.act;
+    hideContextMenu();
+    if (act === 'detail') showDetail(id);
+    else if (act === 'curl') {
+      const curl = generateCurl(request);
+      navigator.clipboard.writeText(curl).then(() => showToast('已复制 cURL'));
+    } else if (act === 'url') {
+      navigator.clipboard.writeText(request.url).then(() => showToast('已复制 URL'));
+    } else if (act === 'star') {
+      chrome.runtime.sendMessage({ type: 'TOGGLE_STAR', data: { id } }, () => {
+        const local = findRequestById(id);
+        if (local) local.starred = !local.starred;
+        renderRequests({ incremental: true });
+        showToast(local?.starred ? '已收藏' : '已取消收藏');
+      });
+    } else if (act === 'mock') {
+      currentView = 'mock';
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.view === 'mock'));
+      updateViewVisibility();
+      renderMockRules();
+      openMockEditorFromRequest(request);
+    } else if (act === 'filter-domain' && domain) {
+      document.getElementById('filter-url').value = domain;
+      renderRequests();
+      showToast(`已过滤：${domain}`);
+    } else if (act === 'toggle-select') {
+      if (selectedIds.has(id)) selectedIds.delete(id);
+      else selectedIds.add(id);
+      renderRequests({ incremental: true });
+      if (selectedIds.size >= 2) showCompare();
+    } else if (act === 'compare') {
+      if (!selectedIds.has(id)) selectedIds.add(id);
+      renderRequests({ incremental: true });
+      if (selectedIds.size >= 2) showCompare();
+      else showToast('请再 Ctrl/⌘ 选择至少 1 条');
+    }
+  };
+}
+
+// ============ 场景结果 ============
+
+function bindScenarioResultEvents() {
+  const close = document.getElementById('btn-close-scenario');
+  const overlay = document.getElementById('scenario-overlay');
+  if (!close || !overlay) return;
+  close.addEventListener('click', () => { overlay.style.display = 'none'; });
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) overlay.style.display = 'none';
+  });
+}
+
+function showScenarioResults(results, scenarioId) {
+  const passed = results.filter(item => item.passed).length;
+  const failed = results.length - passed;
+  let html = `<div class="batch-summary">
+    <span class="stat ok"><b>${passed}</b><span>通过</span></span>
+    <span class="stat err"><b>${failed}</b><span>失败</span></span>
+    <span class="stat"><b>${results.length}</b><span>步骤</span></span>
+  </div>`;
+  html += results.map((item, index) => {
+    const failures = (item.failures || []).join('；') || (item.passed ? '全部断言通过' : '未通过');
+    return `<div class="batch-item ${item.passed ? 'is-pass' : 'is-fail'}">
+      <span class="batch-status ${item.passed ? 'status-2xx' : 'status-5xx'}">${item.passed ? 'PASS' : 'FAIL'}</span>
+      <span class="batch-url" title="${escapeHtml(item.url || '')}">${index + 1}. ${escapeHtml(getShortUrl(item.url || `#${item.id}`))}</span>
+      <span class="batch-detail">${escapeHtml(failures)}</span>
+    </div>`;
+  }).join('') || '<div class="no-data">没有步骤结果</div>';
+  document.getElementById('scenario-content').innerHTML = html;
+  document.getElementById('scenario-overlay').style.display = 'flex';
+  showToast(`场景完成：${passed}/${results.length} 通过`);
+}
+
+// ============ Mock 导入导出 ============
+
+function bindMockTransferEvents() {
+  document.getElementById('btn-export-mocks')?.addEventListener('click', () => {
+    if (currentRuleTab !== 'mock') {
+      const rules = advancedRules[currentRuleTab] || [];
+      downloadFile(JSON.stringify({ version: 1, kind: currentRuleTab, rules }, null, 2), 'application/json',
+        `netcatcher-${currentRuleTab}-rules.json`);
+      showToast(`已导出 ${rules.length} 条规则`);
+      return;
+    }
+    chrome.runtime.sendMessage({ type: 'GET_MOCK_RULES' }, res => {
+      const rules = res?.rules || mockRules || [];
+      downloadFile(JSON.stringify({ version: 1, rules }, null, 2), 'application/json',
+        `netcatcher-mocks-${new Date().toISOString().slice(0, 10)}.json`);
+      showToast(`已导出 ${rules.length} 条 Mock 规则`);
+    });
+  });
+  document.getElementById('btn-import-mocks')?.addEventListener('click', () => {
+    document.getElementById('mock-file-input')?.click();
+  });
+  document.getElementById('mock-file-input')?.addEventListener('change', async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    try {
+      const parsed = JSON.parse(await file.text());
+      const rules = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.rules) ? parsed.rules : []);
+      if (!rules.length) { showToast('文件中没有规则'); return; }
+      if (currentRuleTab === 'mock' || !parsed.kind) {
+        chrome.runtime.sendMessage({ type: 'IMPORT_MOCK_RULES', data: { rules } }, res => {
+          if (res?.error) { showToast(res.error); return; }
+          loadRequests();
+          showToast(`已导入 ${res?.count || rules.length} 条 Mock 规则`);
+        });
+        return;
+      }
+      let done = 0;
+      rules.forEach(rule => {
+        chrome.runtime.sendMessage({ type: 'ADD_ADVANCED_RULE', data: { ...rule, kind: currentRuleTab } }, () => {
+          done += 1;
+          if (done === rules.length) {
+            loadAdvancedRules().then(renderAdvancedRules);
+            showToast(`已导入 ${done} 条规则`);
+          }
+        });
+      });
+    } catch {
+      showToast('规则文件格式无效');
+    }
+  });
+}
+
+// ============ 高级规则（改写/映射/限速/断点/环境/脚本） ============
+
+const RULE_META = {
+  mock: { title: 'Mock', hint: '匹配的请求直接返回自定义响应', create: true },
+  rewrite: { title: '改写', hint: '修改请求 URL/方法/头/体后再发出', create: true },
+  mapLocal: { title: '本地映射', hint: '像本地文件一样返回固定响应体', create: true },
+  throttle: { title: '限速', hint: '注入延迟或按概率失败', create: true },
+  breakpoint: { title: '断点', hint: '命中后暂停，可改写或中止', create: true },
+  hostMap: { title: '环境映射', hint: '将请求主机映射到测试环境', create: true },
+  script: { title: '脚本', hint: '用 JS 改写响应 body（body 为入参，可改写后 return）', create: true },
+  pending: { title: '挂起断点', hint: '正在等待放行的请求', create: false },
+};
+
+function loadAdvancedRules() {
+  return new Promise(resolve => {
+    chrome.runtime.sendMessage({ type: 'GET_ADVANCED_RULES' }, res => {
+      if (res && !res.error) {
+        advancedRules = {
+          rewrite: res.rewriteRules || [],
+          mapLocal: res.mapLocalRules || [],
+          throttle: res.throttleRules || [],
+          breakpoint: res.breakpointRules || [],
+          hostMap: res.hostMapRules || [],
+          script: res.scriptRules || [],
+          pending: res.pendingBreakpoints || [],
+        };
+        const badge = document.getElementById('pending-count');
+        if (badge) badge.textContent = String(advancedRules.pending.length);
+      }
+      resolve();
+    });
+  });
+}
+
+function bindAdvancedRulesUI() {
+  document.querySelectorAll('.rules-tab').forEach(btn => {
+    btn.addEventListener('click', () => {
+      currentRuleTab = btn.dataset.ruleTab;
+      document.querySelectorAll('.rules-tab').forEach(b => b.classList.toggle('active', b === btn));
+      const meta = RULE_META[currentRuleTab];
+      const hint = document.getElementById('rules-hint');
+      const addBtn = document.getElementById('btn-add-mock');
+      if (hint) hint.textContent = meta.hint;
+      if (addBtn) {
+        addBtn.style.display = meta.create ? '' : 'none';
+        addBtn.textContent = currentRuleTab === 'mock' ? '新建规则' : `新建${meta.title}`;
+      }
+      if (currentRuleTab === 'mock') renderMockRules();
+      else {
+        loadAdvancedRules().then(renderAdvancedRules);
+      }
+    });
+  });
+
+  document.getElementById('btn-add-mock').addEventListener('click', () => {
+    if (currentRuleTab === 'mock') openMockEditor();
+    else openAdvancedRuleEditor(currentRuleTab);
+  });
+}
+
+function renderAdvancedRules() {
+  const list = document.getElementById('mock-list');
+  if (!list) return;
+  if (currentRuleTab === 'pending') {
+    if (!advancedRules.pending.length) {
+      list.innerHTML = '<div class="empty-state"><div class="empty-symbol">⏸</div><div class="empty-title">暂无挂起请求</div><div class="empty-hint">命中「断点」规则后会出现在这里</div></div>';
+      return;
+    }
+    list.innerHTML = advancedRules.pending.map(item => `
+      <div class="mock-item" data-id="${escapeHtml(item.id)}">
+        <div class="mock-item-header">
+          <span class="mock-name">${escapeHtml(item.snapshot?.method || 'GET')} ${escapeHtml(getShortUrl(item.snapshot?.url || ''))}</span>
+          <div class="mock-actions">
+            <button class="btn btn-small btn-green bp-resume" data-id="${escapeHtml(item.id)}">继续</button>
+            <button class="btn btn-small btn-red bp-abort" data-id="${escapeHtml(item.id)}">中止</button>
+          </div>
+        </div>
+        <div class="mock-item-detail">
+          <span class="mock-pattern">${escapeHtml(item.snapshot?.url || '')}</span>
+          <span class="mock-status">${new Date(item.createdAt).toLocaleTimeString()}</span>
+        </div>
+      </div>`).join('');
+    list.querySelectorAll('.bp-resume').forEach(btn => btn.addEventListener('click', () => {
+      chrome.runtime.sendMessage({ type: 'RESUME_BREAKPOINT', data: { id: btn.dataset.id, action: 'continue' } }, () => {
+        loadAdvancedRules().then(renderAdvancedRules);
+        showToast('已放行');
+      });
+    }));
+    list.querySelectorAll('.bp-abort').forEach(btn => btn.addEventListener('click', () => {
+      chrome.runtime.sendMessage({ type: 'RESUME_BREAKPOINT', data: { id: btn.dataset.id, action: 'abort' } }, () => {
+        loadAdvancedRules().then(renderAdvancedRules);
+        showToast('已中止');
+      });
+    }));
+    return;
+  }
+
+  const rules = advancedRules[currentRuleTab] || [];
+  if (!rules.length) {
+    list.innerHTML = `<div class="empty-state"><div class="empty-symbol">◎</div><div class="empty-title">暂无${RULE_META[currentRuleTab]?.title || ''}规则</div><div class="empty-hint">${RULE_META[currentRuleTab]?.hint || ''}</div></div>`;
+    return;
+  }
+
+  list.innerHTML = rules.map(rule => {
+    const detail = currentRuleTab === 'rewrite'
+      ? `→ ${escapeHtml(rule.replaceUrl || '(仅改写头/体)')}`
+      : currentRuleTab === 'mapLocal'
+        ? `${rule.status} · ${String(rule.body || '').slice(0, 40)}`
+        : currentRuleTab === 'throttle'
+          ? `延迟 ${rule.delayMs || 0}ms · 失败率 ${Math.round((rule.errorRate || 0) * 100)}%`
+          : currentRuleTab === 'hostMap'
+            ? `→ ${escapeHtml(rule.toHost || '')}`
+            : currentRuleTab === 'script'
+              ? escapeHtml(String(rule.script || '').slice(0, 60))
+              : `${escapeHtml(rule.method || '*')} ${escapeHtml(rule.pattern || '')}`;
+    return `<div class="mock-item" data-id="${rule.id}">
+      <div class="mock-item-header">
+        <label class="mock-toggle">
+          <input type="checkbox" ${rule.enabled ? 'checked' : ''} data-id="${rule.id}">
+          <span class="mock-name">${escapeHtml(rule.name || rule.pattern || '规则')}</span>
+        </label>
+        <div class="mock-actions">
+          <button class="btn btn-small adv-edit" data-id="${rule.id}">编辑</button>
+          <button class="btn btn-small btn-red adv-del" data-id="${rule.id}">删除</button>
+        </div>
+      </div>
+      <div class="mock-item-detail">
+        <span class="mock-pattern">${detail}</span>
+        <span class="mock-status">P${rule.priority || 0}</span>
+      </div>
+    </div>`;
+  }).join('');
+
+  list.querySelectorAll('.mock-toggle input').forEach(input => {
+    input.addEventListener('change', () => {
+      chrome.runtime.sendMessage({ type: 'TOGGLE_ADVANCED_RULE', data: { kind: currentRuleTab, id: Number(input.dataset.id) } }, () => {
+        loadAdvancedRules().then(renderAdvancedRules);
+      });
+    });
+  });
+  list.querySelectorAll('.adv-edit').forEach(btn => btn.addEventListener('click', () => {
+    const rule = (advancedRules[currentRuleTab] || []).find(r => r.id === Number(btn.dataset.id));
+    if (rule) openAdvancedRuleEditor(currentRuleTab, rule);
+  }));
+  list.querySelectorAll('.adv-del').forEach(btn => btn.addEventListener('click', () => {
+    chrome.runtime.sendMessage({ type: 'DELETE_ADVANCED_RULE', data: { kind: currentRuleTab, id: Number(btn.dataset.id) } }, () => {
+      loadAdvancedRules().then(renderAdvancedRules);
+      showToast('规则已删除');
+    });
+  }));
+}
+
+function openAdvancedRuleEditor(kind, rule = null) {
+  const title = `${rule ? '编辑' : '新建'}${RULE_META[kind]?.title || '规则'}`;
+  let extra = '';
+  if (kind === 'rewrite') {
+    extra = `
+      <div class="form-row"><label>替换 URL</label><input id="adv-replace-url" class="control" value="${escapeHtml(rule?.replaceUrl || '')}" placeholder="可选，支持正则捕获"></div>
+      <div class="form-row"><label>覆盖方法</label>
+        <select id="adv-method-override" class="control">
+          <option value="*">不改</option>
+          ${['GET','POST','PUT','PATCH','DELETE'].map(m => `<option ${rule?.methodOverride === m ? 'selected' : ''}>${m}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row"><label>Header 操作 JSON</label>
+        <textarea id="adv-header-ops" class="control textarea" rows="3" placeholder='[{"op":"set","name":"x-debug","value":"1"}]'>${escapeHtml(JSON.stringify(rule?.headerOps || [], null, 2))}</textarea>
+      </div>
+      <div class="form-row"><label>Body 替换 JSON</label>
+        <textarea id="adv-body-ops" class="control textarea" rows="3" placeholder='[{"find":"a","replace":"b"}]'>${escapeHtml(JSON.stringify(rule?.bodyReplacements || [], null, 2))}</textarea>
+      </div>`;
+  } else if (kind === 'mapLocal') {
+    extra = `
+      <div class="form-row"><label>状态码</label><input id="adv-status" type="number" class="control" value="${rule?.status || 200}"></div>
+      <div class="form-row"><label>响应头 JSON</label><input id="adv-headers" class="control" value="${escapeHtml(JSON.stringify(rule?.headers || { 'content-type': 'application/json' }))}"></div>
+      <div class="form-row"><label>响应体</label><textarea id="adv-body" class="control textarea" rows="5">${escapeHtml(rule?.body || '{"code":0}')}</textarea></div>
+      <div class="form-row"><label>延迟 ms</label><input id="adv-delay" type="number" class="control" value="${rule?.delay || 0}"></div>`;
+  } else if (kind === 'throttle') {
+    extra = `
+      <div class="form-row"><label>延迟 ms</label><input id="adv-delay-ms" type="number" class="control" value="${rule?.delayMs || 800}"></div>
+      <div class="form-row"><label>失败率 0-1</label><input id="adv-error-rate" type="number" step="0.1" min="0" max="1" class="control" value="${rule?.errorRate || 0}"></div>
+      <div class="form-row"><label>失败文案</label><input id="adv-error-msg" class="control" value="${escapeHtml(rule?.errorMessage || 'Throttled network error')}"></div>`;
+  } else if (kind === 'hostMap') {
+    extra = `<div class="form-row"><label>目标主机</label><input id="adv-to-host" class="control" value="${escapeHtml(rule?.toHost || '')}" placeholder="api.test.com 或 https://api.test.com"></div>`;
+  } else if (kind === 'script') {
+    extra = `<div class="form-row"><label>响应脚本（body 入参）</label>
+      <textarea id="adv-script" class="control textarea" rows="6" placeholder="if (body.includes('\"code\":1')) body = body.replace('\"code\":1','\"code\":0');">${escapeHtml(rule?.script || '')}</textarea></div>`;
+  }
+
+  const overlay = document.createElement('div');
+  overlay.className = 'detail-overlay';
+  overlay.style.display = 'flex';
+  overlay.innerHTML = `
+    <div class="detail-panel save-filter-panel" style="max-height:520px">
+      <div class="detail-header">
+        <span class="detail-title">${title}</span>
+        <div class="detail-actions">
+          <button class="btn btn-primary" id="adv-save">保存</button>
+          <button class="btn-close" id="adv-close">✕</button>
+        </div>
+      </div>
+      <div class="mock-edit-form">
+        <div class="form-row"><label>名称</label><input id="adv-name" class="control" value="${escapeHtml(rule?.name || '')}"></div>
+        <div class="form-row"><label>URL 匹配</label><input id="adv-pattern" class="control" value="${escapeHtml(rule?.pattern || '')}" placeholder="片段或正则"></div>
+        <div class="form-row form-row-inline"><label><input type="checkbox" id="adv-regex" ${rule?.isRegex ? 'checked' : ''}> 正则</label></div>
+        <div class="form-grid">
+          <div class="form-row"><label>方法</label>
+            <select id="adv-method" class="control">
+              <option value="*">全部</option>
+              ${['GET','POST','PUT','PATCH','DELETE'].map(m => `<option ${rule?.method === m ? 'selected' : ''}>${m}</option>`).join('')}
+            </select>
+          </div>
+          <div class="form-row"><label>优先级</label><input id="adv-priority" type="number" class="control" value="${rule?.priority || 0}"></div>
+        </div>
+        ${extra}
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  overlay.querySelector('#adv-close').onclick = close;
+  overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+  overlay.querySelector('#adv-save').onclick = () => {
+    const payload = {
+      kind,
+      id: rule?.id,
+      name: overlay.querySelector('#adv-name').value,
+      pattern: overlay.querySelector('#adv-pattern').value,
+      isRegex: overlay.querySelector('#adv-regex').checked,
+      method: overlay.querySelector('#adv-method').value,
+      priority: overlay.querySelector('#adv-priority').value,
+      enabled: rule ? rule.enabled : true,
+    };
+    try {
+      if (kind === 'rewrite') {
+        payload.replaceUrl = overlay.querySelector('#adv-replace-url').value;
+        payload.methodOverride = overlay.querySelector('#adv-method-override').value;
+        payload.headerOps = JSON.parse(overlay.querySelector('#adv-header-ops').value || '[]');
+        payload.bodyReplacements = JSON.parse(overlay.querySelector('#adv-body-ops').value || '[]');
+      } else if (kind === 'mapLocal') {
+        payload.status = overlay.querySelector('#adv-status').value;
+        payload.headers = JSON.parse(overlay.querySelector('#adv-headers').value || '{}');
+        payload.body = overlay.querySelector('#adv-body').value;
+        payload.delay = overlay.querySelector('#adv-delay').value;
+      } else if (kind === 'throttle') {
+        payload.delayMs = overlay.querySelector('#adv-delay-ms').value;
+        payload.errorRate = overlay.querySelector('#adv-error-rate').value;
+        payload.errorMessage = overlay.querySelector('#adv-error-msg').value;
+      } else if (kind === 'hostMap') {
+        payload.toHost = overlay.querySelector('#adv-to-host').value;
+      } else if (kind === 'script') {
+        payload.script = overlay.querySelector('#adv-script').value;
+      }
+    } catch {
+      showToast('JSON 配置格式无效');
+      return;
+    }
+    const type = rule ? 'UPDATE_ADVANCED_RULE' : 'ADD_ADVANCED_RULE';
+    chrome.runtime.sendMessage({ type, data: payload }, res => {
+      if (res?.error) { showToast(res.error); return; }
+      close();
+      loadAdvancedRules().then(renderAdvancedRules);
+      showToast('规则已保存');
+    });
+  };
+}
+
+// ============ 统计 / 基线 / 会话包 / 快捷键 ============
+
+function bindStatsAndBaseline() {
+  const statsOverlay = document.getElementById('stats-overlay');
+  const baselineOverlay = document.getElementById('baseline-overlay');
+  document.getElementById('btn-show-stats')?.addEventListener('click', () => {
+    chrome.runtime.sendMessage({ type: 'GET_STATS' }, res => {
+      const s = res?.stats;
+      if (!s) return;
+      document.getElementById('stats-content').innerHTML = `
+        <div class="batch-summary">
+          <span class="stat"><b>${s.total}</b><span>请求</span></span>
+          <span class="stat err"><b>${s.errors}</b><span>异常</span></span>
+          <span class="stat time"><span>均耗时</span><b>${s.avgDuration}ms</b></span>
+        </div>
+        <div class="header-section-title">Top 主机</div>
+        ${s.topHosts.map(([k, v]) => `<div class="batch-item"><span class="batch-status">${v}</span><span class="batch-url">${escapeHtml(k)}</span><span></span></div>`).join('')}
+        <div class="header-section-title">Top 路径</div>
+        ${s.topPaths.map(([k, v]) => `<div class="batch-item"><span class="batch-status">${v}</span><span class="batch-url">${escapeHtml(k)}</span><span></span></div>`).join('')}
+        <div class="header-section-title">最慢请求</div>
+        ${s.slowest.map(item => `<div class="batch-item"><span class="batch-status">${Math.round(item.duration)}ms</span><span class="batch-url">${escapeHtml(item.method)} ${escapeHtml(getShortUrl(item.url))}</span><span class="batch-detail">${item.status || '---'}</span></div>`).join('')}
+      `;
+      statsOverlay.style.display = 'flex';
+    });
+  });
+  document.getElementById('btn-close-stats')?.addEventListener('click', () => { statsOverlay.style.display = 'none'; });
+  statsOverlay?.addEventListener('click', e => { if (e.target === statsOverlay) statsOverlay.style.display = 'none'; });
+
+  document.getElementById('btn-pin-baseline')?.addEventListener('click', () => {
+    chrome.runtime.sendMessage({ type: 'PIN_BASELINE', data: { ids: selectedIds.size ? Array.from(selectedIds) : null } }, res => {
+      if (res?.ok) showToast(`已钉住基线 ${res.count} 条`);
+    });
+  });
+  document.getElementById('btn-compare-baseline')?.addEventListener('click', () => {
+    chrome.runtime.sendMessage({ type: 'COMPARE_BASELINE' }, res => {
+      if (res?.error) { showToast(res.error); return; }
+      document.getElementById('baseline-content').innerHTML = `
+        <div class="batch-summary">
+          <span class="stat"><b>${res.baselineCount}</b><span>基线</span></span>
+          <span class="stat warn"><b>${res.diffs?.length || 0}</b><span>差异</span></span>
+        </div>
+        ${(res.diffs || []).map(d => `<div class="batch-item">
+          <span class="batch-status ${d.type === 'added' ? 'status-3xx' : 'status-4xx'}">${d.type === 'added' ? 'NEW' : 'Δ'}</span>
+          <span class="batch-url">${escapeHtml(d.key)}</span>
+          <span class="batch-detail">${d.statusChanged ? `${d.baseStatus}→${d.status}` : (d.bodyChanged ? 'body 变化' : '')}</span>
+        </div>`).join('') || '<div class="no-data">无差异</div>'}
+      `;
+      baselineOverlay.style.display = 'flex';
+    });
+  });
+  document.getElementById('btn-close-baseline')?.addEventListener('click', () => { baselineOverlay.style.display = 'none'; });
+  baselineOverlay?.addEventListener('click', e => { if (e.target === baselineOverlay) baselineOverlay.style.display = 'none'; });
+}
+
+function bindSessionPackage() {
+  document.getElementById('btn-export-session')?.addEventListener('click', () => {
+    chrome.runtime.sendMessage({ type: 'EXPORT_SESSION_PACKAGE' }, res => {
+      if (!res?.package) return;
+      downloadFile(JSON.stringify(res.package, null, 2), 'application/json',
+        `netcatcher-session-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`);
+      showToast('会话包已导出');
+    });
+  });
+  document.getElementById('btn-import-session')?.addEventListener('click', () => {
+    document.getElementById('session-file-input')?.click();
+  });
+  document.getElementById('session-file-input')?.addEventListener('change', async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    try {
+      const pack = JSON.parse(await file.text());
+      chrome.runtime.sendMessage({ type: 'IMPORT_SESSION_PACKAGE', data: { package: pack } }, res => {
+        if (res?.error) { showToast(res.error); return; }
+        loadRequests();
+        showToast(`会话包已导入（${res?.count || 0} 条请求）`);
+      });
+    } catch {
+      showToast('会话包格式无效');
+    }
+  });
+}
+
+function bindShortcutsHelp() {
+  const overlay = document.getElementById('shortcuts-overlay');
+  document.getElementById('btn-shortcuts')?.addEventListener('click', () => {
+    overlay.style.display = 'flex';
+  });
+  document.getElementById('btn-close-shortcuts')?.addEventListener('click', () => {
+    overlay.style.display = 'none';
+  });
+  overlay?.addEventListener('click', e => {
+    if (e.target === overlay) overlay.style.display = 'none';
   });
 }
 
@@ -963,15 +2178,28 @@ function showDetail(id) {
 
   document.getElementById('detail-title').textContent = `${r.method} ${getShortUrl(r.url)}`;
 
-  let headersHtml = '<div class="header-section-title">常规信息</div>';
-  headersHtml += `<table class="header-table">
-    <tr><td>请求 URL</td><td class="detail-url">${escapeHtml(r.url)}</td></tr>
-    <tr><td>请求方法</td><td>${escapeHtml(r.method)}</td></tr>
-    <tr><td>类型</td><td>${escapeHtml(r.type)}</td></tr>
-    <tr><td>状态码</td><td class="${getStatusClass(r.status)}">${r.status || '---'} ${escapeHtml(r.statusText || '')}</td></tr>
-    <tr><td>耗时</td><td>${r.duration ? Math.round(r.duration) + 'ms' : '---'}</td></tr>
-    <tr><td>大小</td><td>${r.size ? formatSize(r.size) : '---'}</td></tr>
-  </table>`;
+  const statusEl = document.getElementById('detail-status');
+  if (statusEl) {
+    const statusClass = r.status ? getStatusClass(r.status) : 'status-0';
+    statusEl.textContent = r.status || '---';
+    statusEl.className = `overview-val ${statusClass}`;
+  }
+  const durationEl = document.getElementById('detail-duration');
+  if (durationEl) durationEl.textContent = r.duration ? `${Math.round(r.duration)}ms` : '—';
+  const sizeEl = document.getElementById('detail-size');
+  if (sizeEl) sizeEl.textContent = r.size ? formatSize(r.size) : '—';
+  const typeEl = document.getElementById('detail-type');
+  if (typeEl) {
+    const typeInfo = getTypeInfo(r.type);
+    typeEl.innerHTML = `<span class="req-type ${typeInfo.cls}">${typeInfo.label}</span>`;
+  }
+  const urlBox = document.getElementById('detail-url-box');
+  if (urlBox) {
+    urlBox.textContent = r.url;
+    urlBox.title = r.url;
+  }
+
+  let headersHtml = '';
   if (r.graphql) {
     headersHtml += `<div class="header-section-title">GraphQL</div><table class="header-table">
       <tr><td>操作名</td><td>${escapeHtml(r.graphql.operationName || '匿名操作')}</td></tr>
@@ -997,7 +2225,7 @@ function showDetail(id) {
     headersHtml += '</table>';
   }
 
-  document.getElementById('tab-headers').innerHTML = headersHtml;
+  document.getElementById('tab-headers').innerHTML = headersHtml || '<div class="no-data">暂无 Header 信息</div>';
   document.getElementById('tab-request').innerHTML = r.requestBody ?
     `<div class="body-content">${formatBody(r.requestBody)}</div>` : '<div class="no-data">无请求体</div>';
   document.getElementById('tab-response').innerHTML = r.responseBody ?
@@ -1015,7 +2243,8 @@ function showDetail(id) {
   document.getElementById('assert-duration').value = assertions.maxDurationMs ?? '';
   document.getElementById('assert-json').value = (assertions.jsonChecks || [])
     .map(check => `${check.path}=${check.expected}`).join('\n');
-  document.getElementById('btn-star').textContent = r.starred ? '⭐ 已收藏' : '⭐';
+  document.getElementById('btn-star').textContent = r.starred ? '已收藏' : '收藏';
+  document.getElementById('btn-star').classList.toggle('active', !!r.starred);
 
   const replayMethod = document.getElementById('replay-method');
   replayMethod.innerHTML = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD']
@@ -1082,21 +2311,25 @@ function renderPreview(r) {
 
 // ============ WebSocket ============
 
+const EMPTY_WS_HTML = `
+  <div class="empty-state" id="ws-empty-state">
+    <div class="empty-symbol" aria-hidden="true">⬡</div>
+    <div class="empty-title">等待 WebSocket 连接</div>
+    <div class="empty-hint">页面建立 WS 连接后可查看收发消息并重放</div>
+  </div>`;
+
 function renderWsConnections() {
   const list = document.getElementById('ws-list');
-  const empty = document.getElementById('ws-empty-state');
   document.getElementById('ws-count').textContent = allWsConnections.length;
   const query = document.getElementById('ws-filter').value.toLowerCase();
   const connections = allWsConnections.filter(conn => !query || conn.url.toLowerCase().includes(query) ||
     (conn.messages || []).some(message => String(message.data).toLowerCase().includes(query)));
 
   if (connections.length === 0) {
-    list.querySelectorAll('.ws-item').forEach(el => el.remove());
-    empty.style.display = 'flex';
+    list.innerHTML = EMPTY_WS_HTML;
     return;
   }
 
-  empty.style.display = 'none';
   list.innerHTML = connections.map(conn => {
     const statusClass = conn.status === 'open' ? 'ws-open' : (conn.status === 'error' ? 'ws-error' : (conn.status === 'connecting' ? 'ws-connecting' : 'ws-closed'));
     const msgCount = conn.messageCount ? (conn.messageCount.send + conn.messageCount.receive) : (conn.messages || []).length;
@@ -1138,9 +2371,10 @@ function showWsDetail(id) {
   const messages = (conn.messages || []).filter(message =>
     (!direction || message.direction === direction) && (!query || String(message.data).toLowerCase().includes(query))
   );
+  renderWsMessageTimeline(messages, conn);
   document.getElementById('ws-messages').innerHTML = messages.length === 0 ?
     '<div class="ws-no-messages">暂无消息</div>' :
-    messages.map(msg => {
+    messages.map((msg, index) => {
       const dirClass = msg.direction === 'send' ? 'ws-msg-send' : 'ws-msg-receive';
       let data = msg.data;
       if (msg.encoding === 'base64') {
@@ -1149,7 +2383,7 @@ function showWsDetail(id) {
       } else {
         try { data = JSON.stringify(JSON.parse(msg.data), null, 2); } catch {}
       }
-      return `<div class="ws-message ${dirClass}">
+      return `<div class="ws-message ${dirClass}" data-msg-index="${index}">
         <div class="ws-msg-header">
           <span class="ws-msg-dir">${msg.direction === 'send' ? '↑ 发送' : '↓ 接收'}</span>
           <span class="ws-msg-type">${escapeHtml(msg.type)}</span>
@@ -1162,6 +2396,66 @@ function showWsDetail(id) {
   document.getElementById('ws-detail-overlay').style.display = 'flex';
   const container = document.getElementById('ws-messages');
   container.scrollTop = container.scrollHeight;
+}
+
+function renderWsMessageTimeline(messages, conn) {
+  const root = document.getElementById('ws-timeline');
+  if (!root) return;
+  if (!messages.length) {
+    root.hidden = true;
+    root.innerHTML = '';
+    return;
+  }
+
+  const start = Math.min(...messages.map(m => Number(m.timestamp) || 0), conn.startTime || messages[0].timestamp || 0);
+  const end = Math.max(...messages.map(m => Number(m.timestamp) || 0), conn.endTime || start);
+  const span = Math.max(1, end - start);
+
+  const makeMarker = (msg, index) => {
+    const t = Number(msg.timestamp) || start;
+    const left = Math.max(0, Math.min(100, ((t - start) / span) * 100));
+    const dir = msg.direction === 'send' ? 'send' : 'receive';
+    const preview = String(msg.data || '').replace(/\s+/g, ' ').slice(0, 80);
+    return `<button class="ws-tl-marker ${dir}" data-msg-index="${index}" style="left:${left}%"
+      title="${escapeHtml(`${msg.direction === 'send' ? '发送' : '接收'} +${Math.round(t - start)}ms · ${preview}`)}"></button>`;
+  };
+  const sendMarkers = messages.map((msg, index) => msg.direction === 'send' ? makeMarker(msg, index) : '').join('');
+  const recvMarkers = messages.map((msg, index) => msg.direction !== 'send' ? makeMarker(msg, index) : '').join('');
+
+  root.hidden = false;
+  root.innerHTML = `
+    <div class="ws-tl-summary">
+      <span class="stat"><b>${messages.length}</b><span>消息</span></span>
+      <span class="stat ok"><b>${messages.filter(m => m.direction === 'receive').length}</b><span>接收</span></span>
+      <span class="stat"><b>${messages.filter(m => m.direction === 'send').length}</b><span>发送</span></span>
+      <span class="stat time"><span>跨度</span><b>${formatDuration(span)}</b></span>
+    </div>
+    <div class="ws-tl-lanes">
+      <div class="ws-tl-row">
+        <div class="ws-tl-lane-label">发送</div>
+        <div class="ws-tl-lane send">${sendMarkers}</div>
+      </div>
+      <div class="ws-tl-row">
+        <div class="ws-tl-lane-label">接收</div>
+        <div class="ws-tl-lane receive">${recvMarkers}</div>
+      </div>
+    </div>
+    <div class="ws-tl-axis">
+      <span>+0ms</span>
+      <span>+${Math.round(span / 2)}ms</span>
+      <span>+${Math.round(span)}ms</span>
+    </div>`;
+
+  root.querySelectorAll('.ws-tl-marker').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const index = btn.dataset.msgIndex;
+      root.querySelectorAll('.ws-tl-marker').forEach(m => m.classList.toggle('is-active', m.dataset.msgIndex === index));
+      document.getElementById('ws-messages').querySelectorAll('.ws-message').forEach(el => {
+        el.classList.toggle('is-highlight', el.dataset.msgIndex === index);
+        if (el.dataset.msgIndex === index) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      });
+    });
+  });
 }
 
 function closeWsDetail() {
@@ -1188,6 +2482,7 @@ function exportWsMessages() {
 // ============ 工具函数 ============
 
 function closeDetail() {
+  hideTimelineTooltip();
   document.getElementById('detail-overlay').style.display = 'none';
 }
 
@@ -1247,12 +2542,14 @@ function filterAndSortRequests(requests) {
   const typeFilter = document.getElementById('filter-type').value;
   const sort = document.getElementById('filter-sort').value;
   const starredOnly = document.getElementById('filter-starred').checked;
+  const tagFilter = (document.getElementById('filter-tags')?.value || '').trim().toLowerCase();
 
   return requests.filter(r => {
     if (urlFilter && !r.url.toLowerCase().includes(urlFilter)) return false;
     if (methodFilter && r.method !== methodFilter) return false;
     if (typeFilter && r.type !== typeFilter) return false;
     if (starredOnly && !r.starred) return false;
+    if (tagFilter && !(r.tags || []).some(tag => String(tag).toLowerCase().includes(tagFilter))) return false;
     if (statusFilter) {
       if (statusFilter === '0' && (r.status !== 0 && r.status !== null)) return false;
       if (statusFilter === '2xx' && !(r.status >= 200 && r.status < 300)) return false;

@@ -21,7 +21,7 @@
         WS <span class="tab-count" id="ws-count">0</span>
       </button>
       <button id="tab-timeline" class="tab-btn" data-view="timeline">时间线</button>
-      <button id="tab-mock" class="tab-btn" data-view="mock">Mock</button>
+      <button id="tab-mock" class="tab-btn" data-view="mock">规则</button>
     </nav>
 
     <div class="topbar-actions">
@@ -66,8 +66,15 @@
             <div class="menu-grid">
               <button id="btn-import-har" class="btn btn-ghost btn-tiny">导入 HAR</button>
               <button id="btn-import-curl" class="btn btn-ghost btn-tiny">导入 cURL</button>
-              <button id="btn-export" class="btn btn-ghost btn-tiny">导出 HAR</button>
-              <button id="btn-export-openapi" class="btn btn-ghost btn-tiny">导出 OpenAPI</button>
+              <button id="btn-export" class="btn btn-ghost btn-tiny" title="已选中则仅导出选中项">导出 HAR</button>
+              <button id="btn-export-openapi" class="btn btn-ghost btn-tiny" title="已选中则仅导出选中项">导出 OpenAPI</button>
+              <button id="btn-export-session" class="btn btn-ghost btn-tiny">导出会话包</button>
+              <button id="btn-import-session" class="btn btn-ghost btn-tiny">导入会话包</button>
+              <input id="session-file-input" type="file" accept=".json,application/json" hidden>
+              <button id="btn-show-stats" class="btn btn-ghost btn-tiny">统计</button>
+              <button id="btn-pin-baseline" class="btn btn-ghost btn-tiny" title="将当前请求钉为基线">钉基线</button>
+              <button id="btn-compare-baseline" class="btn btn-ghost btn-tiny">对比基线</button>
+              <button id="btn-shortcuts" class="btn btn-ghost btn-tiny" title="快捷键帮助">快捷键</button>
               <button id="btn-batch-replay" class="btn btn-ghost btn-tiny">批量重放</button>
             </div>
           </section>
@@ -139,6 +146,8 @@
     </select>
     <button id="btn-group-toggle" class="btn btn-ghost btn-tiny" title="按域名分组">分组</button>
     <label class="chip-check" title="仅显示收藏"><input type="checkbox" id="filter-starred"><span>收藏</span></label>
+    <input type="text" id="filter-tags" class="control control-compact tag-filter" list="tag-options" placeholder="标签" title="按标签过滤">
+    <datalist id="tag-options"></datalist>
     <div class="filter-saved">
       <select id="saved-filters" class="control control-compact" title="已保存的过滤器">
         <option value="">已存过滤器</option>
@@ -159,6 +168,7 @@
 
   <div class="col-header" id="http-col-header">
     <span class="col-method">方法</span>
+    <span class="col-type">类型</span>
     <span class="col-url">地址</span>
     <span class="col-status">状态</span>
     <span class="col-duration">耗时</span>
@@ -190,64 +200,185 @@
       </div>
     </div>
 
-    <div class="timeline-view list-scroll" id="timeline-view" hidden>
-      <div class="timeline-container" id="timeline-container"></div>
+    <div class="timeline-view" id="timeline-view" hidden>
+      <div class="timeline-summary" id="timeline-summary"></div>
+      <div class="timeline-container list-scroll" id="timeline-container"></div>
     </div>
 
     <div class="mock-view" id="mock-view" hidden>
+      <div class="rules-tabs" id="rules-tabs">
+        <button class="rules-tab active" data-rule-tab="mock">Mock</button>
+        <button class="rules-tab" data-rule-tab="rewrite">改写</button>
+        <button class="rules-tab" data-rule-tab="mapLocal">本地映射</button>
+        <button class="rules-tab" data-rule-tab="throttle">限速</button>
+        <button class="rules-tab" data-rule-tab="breakpoint">断点</button>
+        <button class="rules-tab" data-rule-tab="hostMap">环境映射</button>
+        <button class="rules-tab" data-rule-tab="script">脚本</button>
+        <button class="rules-tab" data-rule-tab="pending">挂起 <span id="pending-count">0</span></button>
+      </div>
       <div class="mock-toolbar">
         <button id="btn-add-mock" class="btn btn-primary">新建规则</button>
-        <span class="mock-hint">启用后，匹配请求将直接返回自定义响应</span>
+        <button id="btn-export-mocks" class="btn btn-ghost btn-tiny" title="导出当前类型规则">导出</button>
+        <button id="btn-import-mocks" class="btn btn-ghost btn-tiny" title="导入规则 JSON">导入</button>
+        <input id="mock-file-input" type="file" accept=".json,application/json" hidden>
+        <span class="mock-hint" id="rules-hint">匹配的请求可被拦截、改写或模拟</span>
       </div>
       <div class="mock-list list-scroll" id="mock-list"></div>
     </div>
   </main>
 
   <div class="detail-overlay" id="detail-overlay" style="display:none">
-    <div class="detail-panel">
+    <div class="detail-panel detail-panel-split">
       <div class="detail-header">
         <span class="detail-title" id="detail-title">请求详情</span>
         <div class="detail-actions">
           <button id="btn-replay" class="btn btn-primary" title="重放请求">重放</button>
+          <button id="btn-mock-from-request" class="btn btn-ghost btn-tiny" title="用此请求创建 Mock 规则">Mock</button>
           <button id="btn-star" class="btn btn-ghost btn-tiny" title="收藏">收藏</button>
           <button id="btn-curl" class="btn btn-ghost btn-tiny" title="复制 cURL">cURL</button>
           <button id="btn-close-detail" class="btn-close" title="关闭" aria-label="关闭">✕</button>
         </div>
       </div>
-      <div class="detail-tags">
-        <label for="detail-tags">标签</label>
-        <input id="detail-tags" class="control" placeholder="逗号分隔，便于筛选归类">
-      </div>
-      <div class="assertion-editor">
-        <label class="assert-label">断言</label>
-        <input id="assert-status" class="control control-compact" type="number" placeholder="状态码">
-        <input id="assert-duration" class="control control-compact" type="number" min="0" placeholder="最大耗时 ms">
-        <button id="btn-save-assertion" class="btn btn-ghost btn-tiny">保存断言</button>
-        <textarea id="assert-json" class="control textarea" rows="2" placeholder="JSON 断言，每行一个，例如 $.code=0"></textarea>
-      </div>
-      <div class="detail-tabs">
-        <button class="tab active" data-tab="tab-headers">Headers</button>
-        <button class="tab" data-tab="tab-request">请求体</button>
-        <button class="tab" data-tab="tab-response">响应体</button>
-        <button class="tab" data-tab="tab-preview">预览</button>
-        <button class="tab" data-tab="tab-replay-result">重放结果</button>
-      </div>
-      <div class="detail-content">
-        <div id="tab-headers" class="tab-content active"></div>
-        <div id="tab-request" class="tab-content"></div>
-        <div id="tab-response" class="tab-content"></div>
-        <div id="tab-preview" class="tab-content"></div>
-        <div id="tab-replay-result" class="tab-content">
-          <div class="replay-editor">
-            <div class="form-row"><label for="replay-method">重放方法</label><select id="replay-method" class="control control-compact"></select></div>
-            <div class="form-row"><label for="replay-headers">请求头 (JSON)</label><textarea id="replay-headers" class="control textarea" rows="4"></textarea></div>
-            <div class="form-row"><label for="replay-body">请求体</label><textarea id="replay-body" class="control textarea" rows="4"></textarea></div>
+      <div class="detail-body">
+        <aside class="detail-side">
+          <div class="side-block">
+            <div class="side-label">概览</div>
+            <div class="overview-grid">
+              <div class="overview-item">
+                <span class="overview-key">状态</span>
+                <span class="overview-val" id="detail-status">—</span>
+              </div>
+              <div class="overview-item">
+                <span class="overview-key">耗时</span>
+                <span class="overview-val" id="detail-duration">—</span>
+              </div>
+              <div class="overview-item">
+                <span class="overview-key">大小</span>
+                <span class="overview-val" id="detail-size">—</span>
+              </div>
+              <div class="overview-item">
+                <span class="overview-key">类型</span>
+                <span class="overview-val" id="detail-type">—</span>
+              </div>
+            </div>
+            <div class="detail-url-box" id="detail-url-box" title=""></div>
           </div>
-          <div id="replay-output" class="no-data">点击「重放」测试请求，结果会显示在这里</div>
-        </div>
+          <div class="side-block">
+            <div class="side-label">标签</div>
+            <input id="detail-tags" class="control" placeholder="逗号分隔">
+          </div>
+          <div class="side-block side-block-grow">
+            <div class="side-label">断言</div>
+            <div class="assert-stack">
+              <input id="assert-status" class="control" type="number" placeholder="状态码">
+              <input id="assert-duration" class="control" type="number" min="0" placeholder="最大耗时 ms">
+              <textarea id="assert-json" class="control textarea" rows="3" placeholder="JSON 断言，每行一个，例如 $.code=0"></textarea>
+              <button id="btn-save-assertion" class="btn btn-ghost btn-tiny">保存断言</button>
+            </div>
+          </div>
+        </aside>
+        <section class="detail-main">
+          <div class="detail-tabs">
+            <button class="tab active" data-tab="tab-headers">Headers</button>
+            <button class="tab" data-tab="tab-request">请求体</button>
+            <button class="tab" data-tab="tab-response">响应体</button>
+            <button class="tab" data-tab="tab-preview">预览</button>
+            <button class="tab" data-tab="tab-replay-result">重放</button>
+          </div>
+          <div class="detail-content">
+            <div id="tab-headers" class="tab-content active"></div>
+            <div id="tab-request" class="tab-content"></div>
+            <div id="tab-response" class="tab-content"></div>
+            <div id="tab-preview" class="tab-content"></div>
+            <div id="tab-replay-result" class="tab-content">
+              <div class="replay-editor">
+                <div class="form-row"><label for="replay-method">重放方法</label><select id="replay-method" class="control control-compact"></select></div>
+                <div class="form-row"><label for="replay-headers">请求头 (JSON)</label><textarea id="replay-headers" class="control textarea" rows="4"></textarea></div>
+                <div class="form-row"><label for="replay-body">请求体</label><textarea id="replay-body" class="control textarea" rows="4"></textarea></div>
+              </div>
+              <div id="replay-output" class="no-data">点击「重放」测试请求，结果会显示在这里</div>
+            </div>
+          </div>
+        </section>
       </div>
     </div>
   </div>
+
+  <div class="detail-overlay" id="scenario-overlay" style="display:none">
+    <div class="detail-panel batch-replay-panel">
+      <div class="detail-header">
+        <span class="detail-title">场景运行结果</span>
+        <div class="detail-actions">
+          <button id="btn-close-scenario" class="btn-close" title="关闭" aria-label="关闭">✕</button>
+        </div>
+      </div>
+      <div class="detail-content" id="scenario-content"></div>
+    </div>
+  </div>
+
+  <div class="detail-overlay" id="batch-replay-overlay" style="display:none">
+    <div class="detail-panel batch-replay-panel">
+      <div class="detail-header">
+        <span class="detail-title">批量重放结果</span>
+        <div class="detail-actions">
+          <button id="btn-close-batch-replay" class="btn-close" title="关闭" aria-label="关闭">✕</button>
+        </div>
+      </div>
+      <div class="detail-content" id="batch-replay-content"></div>
+    </div>
+  </div>
+
+  <div class="detail-overlay" id="stats-overlay" style="display:none">
+    <div class="detail-panel stats-panel">
+      <div class="detail-header">
+        <span class="detail-title">流量统计</span>
+        <div class="detail-actions">
+          <button id="btn-close-stats" class="btn-close" title="关闭">✕</button>
+        </div>
+      </div>
+      <div class="detail-content" id="stats-content"></div>
+    </div>
+  </div>
+
+  <div class="detail-overlay" id="baseline-overlay" style="display:none">
+    <div class="detail-panel batch-replay-panel">
+      <div class="detail-header">
+        <span class="detail-title">基线对比</span>
+        <div class="detail-actions">
+          <button id="btn-close-baseline" class="btn-close" title="关闭">✕</button>
+        </div>
+      </div>
+      <div class="detail-content" id="baseline-content"></div>
+    </div>
+  </div>
+
+  <div class="detail-overlay" id="shortcuts-overlay" style="display:none">
+    <div class="detail-panel shortcuts-panel">
+      <div class="detail-header">
+        <span class="detail-title">键盘快捷键</span>
+        <div class="detail-actions">
+          <button id="btn-close-shortcuts" class="btn-close" title="关闭">✕</button>
+        </div>
+      </div>
+      <div class="detail-content shortcuts-grid">
+        <div><kbd>↑</kbd><kbd>↓</kbd> 切换请求</div>
+        <div><kbd>Enter</kbd> 打开详情</div>
+        <div><kbd>Esc</kbd> 关闭面板</div>
+        <div><kbd>Ctrl/⌘+Click</kbd> 多选对比</div>
+        <div><kbd>/</kbd> 聚焦搜索</div>
+        <div><kbd>r</kbd> 重放当前</div>
+        <div><kbd>c</kbd> 复制 cURL</div>
+        <div><kbd>m</kbd> 跳到规则</div>
+        <div><kbd>t</kbd> 时间线</div>
+        <div><kbd>s</kbd> 统计</div>
+        <div><kbd>?</kbd> 本帮助</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="context-menu" class="context-menu" hidden></div>
+
+  <div id="hover-tooltip" class="hover-tooltip" hidden></div>
 
   <div class="detail-overlay" id="compare-overlay" style="display:none">
     <div class="detail-panel compare-panel">
@@ -275,6 +406,7 @@
         <input id="ws-send-input" class="control" placeholder="输入消息后发送到此连接">
         <button id="btn-ws-send" class="btn btn-primary">发送</button>
       </div>
+      <div class="ws-timeline" id="ws-timeline" hidden></div>
       <div class="ws-messages-container">
         <div class="ws-messages" id="ws-messages"></div>
       </div>

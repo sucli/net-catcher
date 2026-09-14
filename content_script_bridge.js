@@ -7,6 +7,7 @@
   const CAPTURE_TYPES = new Set([
     'NET_REQUEST', 'NET_RESPONSE', 'NET_RESPONSE_BODY', 'NET_STREAM_CHUNK', 'NET_ERROR',
     'WS_OPEN', 'WS_READY', 'WS_MESSAGE', 'WS_CLOSE', 'WS_ERROR',
+    'WAIT_BREAKPOINT',
   ]);
   const bridgeNonce = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ? crypto.randomUUID() :
     `bridge-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -14,7 +15,8 @@
   function publishCaptureConfig(config) {
     window.postMessage({
       __netCatcherConfig: true,
-      hasActiveMockRules: !!config?.hasActiveMockRules,
+      hasActiveMockRules: !!(config?.hasActiveMockRules || config?.hasActiveInterceptRules),
+      isCapturing: config?.isCapturing !== false,
       nonce: bridgeNonce,
     }, '*');
   }

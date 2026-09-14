@@ -21,6 +21,7 @@ const CAPTURE_TYPES = new Set([
   'NET_REQUEST', 'NET_RESPONSE', 'NET_RESPONSE_BODY', 'NET_ERROR',
   'NET_STREAM_CHUNK',
   'WS_OPEN', 'WS_READY', 'WS_MESSAGE', 'WS_CLOSE', 'WS_ERROR',
+  'WAIT_BREAKPOINT',
 ]);
 let requests = [];
 let wsConnections = new Map();
@@ -28,8 +29,16 @@ let networkRecords = new Map();
 let isCapturing = true;
 let requestId = 0;
 let mockRules = [];
+let rewriteRules = [];
+let mapLocalRules = [];
+let throttleRules = [];
+let breakpointRules = [];
+let hostMapRules = [];
+let scriptRules = [];
+let pendingBreakpoints = new Map();
 let savedFilters = [];
 let scenarios = [];
+let baselineSnapshots = new Map();
 let settings = { ...DEFAULT_SETTINGS };
 let storageError = null;
 let persistQueue = Promise.resolve();
@@ -106,7 +115,9 @@ function createPersistedSnapshot() {
 // Wait for persisted state before handling events after a service-worker wake-up.
 const initialization = chrome.storage.local.get([
   'nc_requests', 'nc_wsConnections', 'nc_requestId', 'nc_isCapturing',
-  'nc_mockRules', 'nc_savedFilters', 'nc_scenarios', 'nc_settings', 'nc_sessions', 'nc_activeSessionId'
+  'nc_mockRules', 'nc_rewriteRules', 'nc_mapLocalRules', 'nc_throttleRules',
+  'nc_breakpointRules', 'nc_hostMapRules', 'nc_scriptRules',
+  'nc_savedFilters', 'nc_scenarios', 'nc_settings', 'nc_sessions', 'nc_activeSessionId'
 ]).then(async data => {
   sessions = normalizeSessions(data.nc_sessions);
   activeSessionId = typeof data.nc_activeSessionId === 'string' &&
@@ -120,10 +131,19 @@ const initialization = chrome.storage.local.get([
   });
   if (data.nc_isCapturing !== undefined) isCapturing = data.nc_isCapturing;
   if (data.nc_mockRules) mockRules = data.nc_mockRules;
+  if (Array.isArray(data.nc_rewriteRules)) rewriteRules = data.nc_rewriteRules;
+  if (Array.isArray(data.nc_mapLocalRules)) mapLocalRules = data.nc_mapLocalRules;
+  if (Array.isArray(data.nc_throttleRules)) throttleRules = data.nc_throttleRules;
+  if (Array.isArray(data.nc_breakpointRules)) breakpointRules = data.nc_breakpointRules;
+  if (Array.isArray(data.nc_hostMapRules)) hostMapRules = data.nc_hostMapRules;
+  if (Array.isArray(data.nc_scriptRules)) scriptRules = data.nc_scriptRules;
   if (data.nc_savedFilters) savedFilters = data.nc_savedFilters;
   if (Array.isArray(data.nc_scenarios)) scenarios = data.nc_scenarios;
   if (data.nc_settings) settings = { ...DEFAULT_SETTINGS, ...data.nc_settings };
-}).catch(() => {});
+}).catch(() => {}).finally(() => {
+  updateActionBadge();
+  broadcastCaptureConfig();
+});
 
 // 持久化存储
 // 高频捕获事件（webRequest、WS 消息、SSE chunk）会非常频繁地触发写入，
@@ -159,6 +179,12 @@ function flushPersist() {
   const payload = {
     nc_isCapturing: isCapturing,
     nc_mockRules: mockRules,
+    nc_rewriteRules: rewriteRules,
+    nc_mapLocalRules: mapLocalRules,
+    nc_throttleRules: throttleRules,
+    nc_breakpointRules: breakpointRules,
+    nc_hostMapRules: hostMapRules,
+    nc_scriptRules: scriptRules,
     nc_savedFilters: savedFilters,
     nc_scenarios: scenarios,
     nc_settings: settings,
@@ -546,6 +572,159 @@ function getMockResponse(url, method, requestHeaders = {}, requestBody = '') {
   };
 }
 
+function hasActiveInterceptRules() {
+  return [mockRules, rewriteRules, mapLocalRules, throttleRules, breakpointRules, hostMapRules, scriptRules]
+    .some(list => Array.isArray(list) && list.some(rule => rule?.enabled));
+}
+
+function matchPattern(rule, url, method) {
+  if (!rule?.enabled) return false;
+  const m = String(rule.method || '*').toUpperCase();
+  if (m !== '*' && m !== String(method || 'GET').toUpperCase()) return false;
+  const pattern = String(rule.pattern || '');
+  if (!pattern) return false;
+  try {
+    if (rule.isRegex) return new RegExp(pattern).test(url);
+    return url.includes(pattern);
+  } catch {
+    return url.includes(pattern);
+  }
+}
+
+function normalizeSimpleRule(data, existing = {}) {
+  return {
+    ...existing,
+    id: existing.id ?? data.id,
+    name: String(data.name ?? existing.name ?? '').slice(0, 100),
+    pattern: String(data.pattern ?? existing.pattern ?? '').slice(0, 2048),
+    isRegex: !!(data.isRegex ?? existing.isRegex),
+    method: String(data.method ?? existing.method ?? '*').toUpperCase().slice(0, 32),
+    priority: Math.max(-1000, Math.min(1000, Number.parseInt(data.priority ?? existing.priority, 10) || 0)),
+    enabled: data.enabled ?? existing.enabled ?? true,
+  };
+}
+
+function sortRules(list) {
+  return [...list].sort((a, b) => (b.priority || 0) - (a.priority || 0));
+}
+
+function applyHostMap(url) {
+  const rule = sortRules(hostMapRules).find(item => matchPattern(item, url, '*'));
+  if (!rule?.toHost) return url;
+  try {
+    const u = new URL(url);
+    const target = String(rule.toHost).replace(/\/$/, '');
+    if (/^https?:\/\//i.test(target)) {
+      const t = new URL(target);
+      u.protocol = t.protocol;
+      u.host = t.host;
+    } else {
+      u.host = target;
+    }
+    return u.href;
+  } catch {
+    return url;
+  }
+}
+
+function applyHeaderOps(headers = {}, ops = []) {
+  const result = { ...headers };
+  (ops || []).forEach(op => {
+    const name = String(op.name || '').toLowerCase();
+    if (!name) return;
+    if (op.op === 'remove') delete result[name];
+    else if (op.op === 'set') result[name] = String(op.value ?? '');
+    else if (op.op === 'add') result[name] = `${result[name] ? result[name] + ',' : ''}${op.value ?? ''}`;
+  });
+  return result;
+}
+
+function applyBodyReplacements(body, replacements = []) {
+  let next = typeof body === 'string' ? body : '';
+  (replacements || []).forEach(item => {
+    if (item.find === undefined) return;
+    try {
+      next = next.split(String(item.find)).join(String(item.replace ?? ''));
+    } catch {}
+  });
+  return next;
+}
+
+function buildRewritePlan(url, method, headers, body) {
+  const rules = sortRules(rewriteRules).filter(rule => matchPattern(rule, url, method));
+  if (!rules.length) return null;
+  let nextUrl = url;
+  let nextMethod = method;
+  let nextHeaders = { ...headers };
+  let nextBody = body;
+  let changed = false;
+  rules.forEach(rule => {
+    if (rule.replaceUrl) {
+      try {
+        const replaced = nextUrl.replace(new RegExp(rule.pattern, rule.isRegex ? '' : 'g'), rule.replaceUrl);
+        if (replaced !== nextUrl) { nextUrl = replaced; changed = true; }
+      } catch {}
+    }
+    if (rule.methodOverride && rule.methodOverride !== '*') {
+      nextMethod = String(rule.methodOverride).toUpperCase();
+      changed = true;
+    }
+    if (Array.isArray(rule.headerOps) && rule.headerOps.length) {
+      nextHeaders = applyHeaderOps(nextHeaders, rule.headerOps);
+      changed = true;
+    }
+    if (Array.isArray(rule.bodyReplacements) && rule.bodyReplacements.length) {
+      const replaced = applyBodyReplacements(nextBody, rule.bodyReplacements);
+      if (replaced !== nextBody) { nextBody = replaced; changed = true; }
+    }
+  });
+  if (!changed) return null;
+  return { url: nextUrl, method: nextMethod, headers: nextHeaders, body: nextBody };
+}
+
+function buildMapLocalPlan(url, method) {
+  const rule = sortRules(mapLocalRules).find(item => matchPattern(item, url, method));
+  if (!rule) return null;
+  return {
+    status: Number.parseInt(rule.status, 10) || 200,
+    headers: rule.headers && typeof rule.headers === 'object' ? rule.headers : { 'content-type': 'application/json' },
+    body: String(rule.body ?? ''),
+    delay: Math.max(0, Number.parseInt(rule.delay, 10) || 0),
+  };
+}
+
+function buildThrottlePlan(url, method) {
+  const rule = sortRules(throttleRules).find(item => matchPattern(item, url, method));
+  if (!rule) return null;
+  return {
+    delayMs: Math.max(0, Math.min(60000, Number.parseInt(rule.delayMs, 10) || 0)),
+    errorRate: Math.max(0, Math.min(1, Number(rule.errorRate) || 0)),
+    errorMessage: String(rule.errorMessage || 'Throttled network error'),
+  };
+}
+
+function buildScriptPlan(url, method) {
+  const rule = sortRules(scriptRules).find(item => matchPattern(item, url, method));
+  if (!rule?.script) return null;
+  return { script: String(rule.script).slice(0, 8000) };
+}
+
+function findBreakpointRule(url, method) {
+  return sortRules(breakpointRules).find(item => matchPattern(item, url, method)) || null;
+}
+
+function buildInterceptPlan(url, method, headers, body) {
+  const mappedUrl = applyHostMap(url);
+  return {
+    url: mappedUrl,
+    rewrite: buildRewritePlan(mappedUrl, method, headers, body),
+    mapLocal: buildMapLocalPlan(mappedUrl, method),
+    throttle: buildThrottlePlan(mappedUrl, method),
+    script: buildScriptPlan(mappedUrl, method),
+    breakpointId: findBreakpointRule(mappedUrl, method)?.id ?? null,
+  };
+}
+
 function normalizeMockRuleInput(data, existing = {}) {
   return {
     ...existing,
@@ -818,7 +997,25 @@ function handleMessage(msg, sender, sendResponse) {
   }
 
   if (msg.type === 'GET_CAPTURE_CONFIG') {
-    sendResponse({ hasActiveMockRules: mockRules.some(rule => rule.enabled) });
+    sendResponse({ hasActiveMockRules: hasActiveInterceptRules(), isCapturing });
+    return true;
+  }
+
+  if (msg.type === 'OPEN_SIDE_PANEL') {
+    const windowId = Number.isInteger(msg.data?.windowId) ? msg.data.windowId : null;
+    const tabId = Number.isInteger(msg.data?.tabId) ? msg.data.tabId : null;
+    if (!chrome.sidePanel?.open) {
+      sendResponse({ error: 'sidePanel API 不可用' });
+      return true;
+    }
+    const options = Number.isInteger(windowId) ? { windowId } : (Number.isInteger(tabId) ? { tabId } : null);
+    if (!options) {
+      sendResponse({ error: '缺少 windowId/tabId' });
+      return true;
+    }
+    chrome.sidePanel.open(options)
+      .then(() => sendResponse({ ok: true }))
+      .catch(error => sendResponse({ error: error?.message || String(error) }));
     return true;
   }
 
@@ -832,11 +1029,14 @@ function handleMessage(msg, sender, sendResponse) {
       return;
     }
 
-    // 检查是否有匹配的 Mock 规则
+    // 检查是否有匹配的 Mock / 拦截规则
     const rawData = msg.data;
     const data = sanitizeData(rawData);
-    const mockResponse = rawData.allowMock === false ? null : getMockResponse(
+    const intercept = buildInterceptPlan(
       rawData.url, rawData.method, rawData.requestHeaders, rawData.requestBody
+    );
+    const mockResponse = rawData.allowMock === false ? null : getMockResponse(
+      intercept?.url || rawData.url, rawData.method, rawData.requestHeaders, rawData.requestBody
     );
     const method = validRequestMethod(data.method);
     const type = ['fetch', 'xhr', 'eventsource', 'beacon'].includes(data.type) ? data.type : 'xhr';
@@ -910,7 +1110,25 @@ function handleMessage(msg, sender, sendResponse) {
 
     persist();
     broadcastUpdate();
-    sendResponse({ id: entry.id, mocked: !!mockResponse, mockResponse });
+    sendResponse({
+      id: entry.id,
+      mocked: !!mockResponse,
+      mockResponse,
+      intercept: intercept || null,
+    });
+    return true;
+  }
+
+  if (msg.type === 'WAIT_BREAKPOINT') {
+    const breakpointId = String(msg.data?.breakpointId || '');
+    pendingBreakpoints.set(breakpointId, {
+      captureId: msg.data?.captureId,
+      snapshot: msg.data?.snapshot || {},
+      createdAt: Date.now(),
+      tabId: sender.tab?.id ?? null,
+      sendResponse,
+    });
+    broadcastUpdate();
     return true;
   }
 
@@ -1231,12 +1449,331 @@ function handleMessage(msg, sender, sendResponse) {
     return true;
   }
 
+  if (msg.type === 'GET_ADVANCED_RULES') {
+    sendResponse({
+      rewriteRules, mapLocalRules, throttleRules, breakpointRules, hostMapRules, scriptRules,
+      pendingBreakpoints: Array.from(pendingBreakpoints.entries()).map(([id, item]) => ({
+        id,
+        captureId: item.captureId,
+        snapshot: item.snapshot,
+        createdAt: item.createdAt,
+        tabId: item.tabId,
+      })),
+    });
+    return true;
+  }
+
+  const RULE_KINDS = {
+    rewrite: () => rewriteRules,
+    mapLocal: () => mapLocalRules,
+    throttle: () => throttleRules,
+    breakpoint: () => breakpointRules,
+    hostMap: () => hostMapRules,
+    script: () => scriptRules,
+  };
+  const RULE_SETTERS = {
+    rewrite: (v) => { rewriteRules = v; },
+    mapLocal: (v) => { mapLocalRules = v; },
+    throttle: (v) => { throttleRules = v; },
+    breakpoint: (v) => { breakpointRules = v; },
+    hostMap: (v) => { hostMapRules = v; },
+    script: (v) => { scriptRules = v; },
+  };
+
+  if (msg.type === 'ADD_ADVANCED_RULE') {
+    const kind = msg.data?.kind;
+    if (!RULE_KINDS[kind]) {
+      sendResponse({ error: '未知规则类型' });
+      return true;
+    }
+    const list = RULE_KINDS[kind]();
+    const extra = {};
+    if (kind === 'rewrite') {
+      extra.replaceUrl = String(msg.data.replaceUrl || '');
+      extra.methodOverride = String(msg.data.methodOverride || '*').toUpperCase();
+      extra.headerOps = Array.isArray(msg.data.headerOps) ? msg.data.headerOps.slice(0, 20) : [];
+      extra.bodyReplacements = Array.isArray(msg.data.bodyReplacements) ? msg.data.bodyReplacements.slice(0, 20) : [];
+    } else if (kind === 'mapLocal') {
+      extra.status = Number.parseInt(msg.data.status, 10) || 200;
+      extra.headers = msg.data.headers && typeof msg.data.headers === 'object' ? msg.data.headers : { 'content-type': 'application/json' };
+      extra.body = String(msg.data.body ?? '').slice(0, MAX_CAPTURE_BODY_CHARS);
+      extra.delay = Math.max(0, Number.parseInt(msg.data.delay, 10) || 0);
+    } else if (kind === 'throttle') {
+      extra.delayMs = Math.max(0, Math.min(60000, Number.parseInt(msg.data.delayMs, 10) || 0));
+      extra.errorRate = Math.max(0, Math.min(1, Number(msg.data.errorRate) || 0));
+      extra.errorMessage = String(msg.data.errorMessage || 'Throttled network error').slice(0, 200);
+    } else if (kind === 'hostMap') {
+      extra.toHost = String(msg.data.toHost || '').slice(0, 512);
+    } else if (kind === 'script') {
+      extra.script = String(msg.data.script || '').slice(0, 8000);
+      extra.phase = msg.data.phase === 'response' ? 'response' : 'response';
+    }
+    const rule = {
+      ...normalizeSimpleRule({ ...msg.data, ...extra }),
+      id: Date.now() + Math.floor(Math.random() * 1000),
+      ...extra,
+    };
+    RULE_SETTERS[kind]([...list, rule].slice(-100));
+    persist();
+    broadcastCaptureConfig();
+    sendResponse({ ok: true, rules: RULE_KINDS[kind]() });
+    return true;
+  }
+
+  if (msg.type === 'UPDATE_ADVANCED_RULE') {
+    const kind = msg.data?.kind;
+    if (!RULE_KINDS[kind]) {
+      sendResponse({ error: '未知规则类型' });
+      return true;
+    }
+    const list = RULE_KINDS[kind]();
+    const idx = list.findIndex(rule => rule.id === Number(msg.data.id));
+    if (idx < 0) {
+      sendResponse({ error: '规则不存在' });
+      return true;
+    }
+    list[idx] = { ...list[idx], ...normalizeSimpleRule(msg.data, list[idx]) };
+    if (kind === 'rewrite') {
+      if (msg.data.replaceUrl !== undefined) list[idx].replaceUrl = String(msg.data.replaceUrl || '');
+      if (msg.data.methodOverride !== undefined) list[idx].methodOverride = String(msg.data.methodOverride || '*').toUpperCase();
+      if (Array.isArray(msg.data.headerOps)) list[idx].headerOps = msg.data.headerOps.slice(0, 20);
+      if (Array.isArray(msg.data.bodyReplacements)) list[idx].bodyReplacements = msg.data.bodyReplacements.slice(0, 20);
+    } else if (kind === 'mapLocal') {
+      if (msg.data.status !== undefined) list[idx].status = Number.parseInt(msg.data.status, 10) || 200;
+      if (msg.data.headers !== undefined) list[idx].headers = msg.data.headers;
+      if (msg.data.body !== undefined) list[idx].body = String(msg.data.body).slice(0, MAX_CAPTURE_BODY_CHARS);
+      if (msg.data.delay !== undefined) list[idx].delay = Math.max(0, Number.parseInt(msg.data.delay, 10) || 0);
+    } else if (kind === 'throttle') {
+      if (msg.data.delayMs !== undefined) list[idx].delayMs = Math.max(0, Math.min(60000, Number.parseInt(msg.data.delayMs, 10) || 0));
+      if (msg.data.errorRate !== undefined) list[idx].errorRate = Math.max(0, Math.min(1, Number(msg.data.errorRate) || 0));
+      if (msg.data.errorMessage !== undefined) list[idx].errorMessage = String(msg.data.errorMessage).slice(0, 200);
+    } else if (kind === 'hostMap') {
+      if (msg.data.toHost !== undefined) list[idx].toHost = String(msg.data.toHost).slice(0, 512);
+    } else if (kind === 'script') {
+      if (msg.data.script !== undefined) list[idx].script = String(msg.data.script).slice(0, 8000);
+    }
+    persist();
+    broadcastCaptureConfig();
+    sendResponse({ ok: true, rules: list });
+    return true;
+  }
+
+  if (msg.type === 'DELETE_ADVANCED_RULE') {
+    const kind = msg.data?.kind;
+    if (!RULE_KINDS[kind]) {
+      sendResponse({ error: '未知规则类型' });
+      return true;
+    }
+    const next = RULE_KINDS[kind]().filter(rule => rule.id !== Number(msg.data.id));
+    RULE_SETTERS[kind](next);
+    persist();
+    broadcastCaptureConfig();
+    sendResponse({ ok: true, rules: next });
+    return true;
+  }
+
+  if (msg.type === 'TOGGLE_ADVANCED_RULE') {
+    const kind = msg.data?.kind;
+    if (!RULE_KINDS[kind]) {
+      sendResponse({ error: '未知规则类型' });
+      return true;
+    }
+    const list = RULE_KINDS[kind]();
+    const rule = list.find(item => item.id === Number(msg.data.id));
+    if (rule) {
+      rule.enabled = !rule.enabled;
+      persist();
+      broadcastCaptureConfig();
+    }
+    sendResponse({ ok: !!rule, rules: list });
+    return true;
+  }
+
+  if (msg.type === 'RESUME_BREAKPOINT') {
+    const pending = pendingBreakpoints.get(String(msg.data?.id));
+    if (!pending) {
+      sendResponse({ error: '断点已失效' });
+      return true;
+    }
+    pendingBreakpoints.delete(String(msg.data?.id));
+    const action = msg.data?.action === 'abort' ? 'abort' : 'continue';
+    const options = action === 'continue' && msg.data?.options ? {
+      url: msg.data.options.url,
+      method: msg.data.options.method,
+      headers: msg.data.options.headers,
+      body: msg.data.options.body,
+      mock: msg.data.options.mock || null,
+    } : null;
+    try {
+      pending.sendResponse({ action, options });
+    } catch {}
+    broadcastUpdate();
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (msg.type === 'ABORT_BREAKPOINT') {
+    const pending = pendingBreakpoints.get(String(msg.data?.id));
+    if (pending) {
+      pendingBreakpoints.delete(String(msg.data?.id));
+      try { pending.sendResponse({ action: 'abort' }); } catch {}
+    }
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (msg.type === 'EXPORT_SESSION_PACKAGE') {
+    sendResponse({
+      package: {
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        activeSessionId,
+        sessions,
+        requests: createPersistedSnapshot().requests,
+        wsConnections: Array.from(wsConnections.values()),
+        mockRules,
+        rewriteRules,
+        mapLocalRules,
+        throttleRules,
+        breakpointRules,
+        hostMapRules,
+        scriptRules,
+        savedFilters,
+        scenarios,
+        settings,
+      }
+    });
+    return true;
+  }
+
+  if (msg.type === 'IMPORT_SESSION_PACKAGE') {
+    const pack = msg.data?.package;
+    if (!pack || typeof pack !== 'object') {
+      sendResponse({ error: '会话包无效' });
+      return true;
+    }
+    if (Array.isArray(pack.mockRules)) mockRules = pack.mockRules.slice(0, 200);
+    if (Array.isArray(pack.rewriteRules)) rewriteRules = pack.rewriteRules.slice(0, 100);
+    if (Array.isArray(pack.mapLocalRules)) mapLocalRules = pack.mapLocalRules.slice(0, 100);
+    if (Array.isArray(pack.throttleRules)) throttleRules = pack.throttleRules.slice(0, 100);
+    if (Array.isArray(pack.breakpointRules)) breakpointRules = pack.breakpointRules.slice(0, 100);
+    if (Array.isArray(pack.hostMapRules)) hostMapRules = pack.hostMapRules.slice(0, 100);
+    if (Array.isArray(pack.scriptRules)) scriptRules = pack.scriptRules.slice(0, 100);
+    if (Array.isArray(pack.savedFilters)) savedFilters = pack.savedFilters.slice(0, 50);
+    if (Array.isArray(pack.scenarios)) scenarios = pack.scenarios.slice(0, 50);
+    if (pack.settings && typeof pack.settings === 'object') settings = { ...DEFAULT_SETTINGS, ...pack.settings };
+    if (Array.isArray(pack.requests)) {
+      requests = pack.requests.slice(-MAX_REQUESTS);
+      requestId = Math.max(requestId, ...requests.map(r => Number(r.id) || 0), 0);
+    }
+    persist();
+    broadcastUpdate();
+    broadcastCaptureConfig();
+    sendResponse({ ok: true, count: requests.length });
+    return true;
+  }
+
+  if (msg.type === 'GET_STATS') {
+    const scope = requests;
+    const byHost = {};
+    const byPath = {};
+    let totalDuration = 0;
+    let durationCount = 0;
+    let errors = 0;
+    const slowest = [];
+    scope.forEach(r => {
+      let host = 'unknown';
+      let path = r.url;
+      try {
+        const u = new URL(r.url);
+        host = u.hostname;
+        path = u.pathname;
+      } catch {}
+      byHost[host] = (byHost[host] || 0) + 1;
+      byPath[`${r.method} ${path}`] = (byPath[`${r.method} ${path}`] || 0) + 1;
+      if (r.duration) {
+        totalDuration += r.duration;
+        durationCount += 1;
+        slowest.push({ id: r.id, url: r.url, method: r.method, duration: r.duration, status: r.status });
+      }
+      if (!r.status || r.status >= 400) errors += 1;
+    });
+    slowest.sort((a, b) => b.duration - a.duration);
+    sendResponse({
+      stats: {
+        total: scope.length,
+        errors,
+        avgDuration: durationCount ? Math.round(totalDuration / durationCount) : 0,
+        topHosts: Object.entries(byHost).sort((a, b) => b[1] - a[1]).slice(0, 8),
+        topPaths: Object.entries(byPath).sort((a, b) => b[1] - a[1]).slice(0, 8),
+        slowest: slowest.slice(0, 8),
+      }
+    });
+    return true;
+  }
+
+  if (msg.type === 'PIN_BASELINE') {
+    const ids = Array.isArray(msg.data?.ids) && msg.data.ids.length ? msg.data.ids : requests.map(r => r.id);
+    const snapshot = requests.filter(r => ids.includes(r.id)).map(r => ({
+      id: r.id, url: r.url, method: r.method, status: r.status,
+      responseBody: r.responseBody, duration: r.duration, size: r.size,
+    }));
+    baselineSnapshots.set('default', { at: Date.now(), items: snapshot });
+    sendResponse({ ok: true, count: snapshot.length });
+    return true;
+  }
+
+  if (msg.type === 'COMPARE_BASELINE') {
+    const baseline = baselineSnapshots.get('default');
+    if (!baseline) {
+      sendResponse({ error: '请先钉住基线' });
+      return true;
+    }
+    const byKey = new Map(baseline.items.map(item => [`${item.method} ${item.url}`, item]));
+    const diffs = [];
+    requests.forEach(r => {
+      const key = `${r.method} ${r.url}`;
+      const base = byKey.get(key);
+      if (!base) {
+        diffs.push({ key, type: 'added', status: r.status, duration: r.duration });
+        return;
+      }
+      const statusChanged = base.status !== r.status;
+      const bodyChanged = (base.responseBody || '') !== (r.responseBody || '');
+      if (statusChanged || bodyChanged) {
+        diffs.push({
+          key, type: 'changed', status: r.status, baseStatus: base.status,
+          duration: r.duration, baseDuration: base.duration, bodyChanged, statusChanged,
+        });
+      }
+    });
+    sendResponse({ ok: true, baselineAt: baseline.at, diffs: diffs.slice(0, 100), baselineCount: baseline.items.length });
+    return true;
+  }
+
   if (msg.type === 'ADD_MOCK_RULE') {
     mockRules.push({ id: Date.now(), ...normalizeMockRuleInput(msg.data || {}) });
     persist();
     broadcastUpdate();
     broadcastCaptureConfig();
     sendResponse({ ok: true, rules: mockRules });
+    return true;
+  }
+
+  if (msg.type === 'IMPORT_MOCK_RULES') {
+    const incoming = Array.isArray(msg.data?.rules) ? msg.data.rules.slice(0, 100) : [];
+    if (!incoming.length) {
+      sendResponse({ error: '没有可导入的规则' });
+      return true;
+    }
+    let baseId = Date.now();
+    incoming.forEach((item, index) => {
+      mockRules.push({ id: baseId + index, ...normalizeMockRuleInput(item || {}) });
+    });
+    persist();
+    broadcastUpdate();
+    broadcastCaptureConfig();
+    sendResponse({ ok: true, count: incoming.length, rules: mockRules });
     return true;
   }
 
@@ -1339,6 +1876,8 @@ function handleMessage(msg, sender, sendResponse) {
   if (msg.type === 'TOGGLE_CAPTURE') {
     isCapturing = !isCapturing;
     persist();
+    updateActionBadge();
+    broadcastCaptureConfig();
     sendResponse({ isCapturing });
     return true;
   }
@@ -1362,18 +1901,21 @@ function handleMessage(msg, sender, sendResponse) {
     return true;
   }
 
-  if (msg.type === 'EXPORT_HAR') {
+  if (msg.type === 'EXPORT_HAR' || msg.type === 'EXPORT_OPENAPI') {
+    const ids = Array.isArray(msg.data?.ids) ? msg.data.ids : null;
     const tabId = Number.isInteger(msg.data?.tabId) ? msg.data.tabId : null;
-    const exportRequests = tabId === null ? requests : requests.filter(request => request.tabId === tabId);
-    const har = generateHAR(exportRequests);
-    sendResponse({ har });
-    return true;
-  }
-
-  if (msg.type === 'EXPORT_OPENAPI') {
-    const tabId = Number.isInteger(msg.data?.tabId) ? msg.data.tabId : null;
-    const exportRequests = tabId === null ? requests : requests.filter(request => request.tabId === tabId);
-    sendResponse({ openapi: generateOpenAPI(exportRequests) });
+    let exportRequests = requests;
+    if (ids) {
+      const idSet = new Set(ids);
+      exportRequests = requests.filter(request => idSet.has(request.id));
+    } else if (tabId !== null) {
+      exportRequests = requests.filter(request => request.tabId === tabId);
+    }
+    if (msg.type === 'EXPORT_HAR') {
+      sendResponse({ har: generateHAR(exportRequests) });
+    } else {
+      sendResponse({ openapi: generateOpenAPI(exportRequests) });
+    }
     return true;
   }
 
@@ -1427,7 +1969,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 registerWebRequestListeners();
 
+if (chrome.sidePanel?.setPanelBehavior) {
+  // 图标弹出 popup；侧栏由 popup 内按钮打开，避免手势丢失
+  chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false }).catch(() => {});
+}
+
+function updateActionBadge() {
+  if (!chrome.action?.setBadgeText) return;
+  const total = requests.length;
+  const errors = requests.filter(r => r.status === 0 || (Number.isFinite(r.status) && r.status >= 400)).length;
+  const text = !isCapturing ? '⏸' : (errors > 0 ? String(Math.min(errors, 99)) : (total > 0 ? String(Math.min(total, 99)) : ''));
+  const color = !isCapturing ? '#d29922' : (errors > 0 ? '#f85149' : '#2f81f7');
+  chrome.action.setBadgeText({ text });
+  chrome.action.setBadgeBackgroundColor({ color });
+  chrome.action.setTitle({
+    title: !isCapturing
+      ? 'NetCatcher · 已暂停'
+      : (errors > 0 ? `NetCatcher · ${errors} 个异常 / ${total} 条` : `NetCatcher · ${total} 条请求`),
+  }).catch(() => {});
+}
+
 function broadcastUpdate() {
+  updateActionBadge();
   chrome.runtime.sendMessage({ type: 'REQUESTS_UPDATED' }).catch(() => {});
 }
 
@@ -1435,7 +1998,8 @@ function broadcastCaptureConfig() {
   if (!chrome.tabs?.query) return;
   const message = {
     type: 'CAPTURE_CONFIG_UPDATED',
-    hasActiveMockRules: mockRules.some(rule => rule.enabled),
+    hasActiveMockRules: hasActiveInterceptRules(),
+    isCapturing,
   };
   chrome.tabs.query({}).then(tabs => Promise.all(tabs
     .filter(tab => Number.isInteger(tab.id))

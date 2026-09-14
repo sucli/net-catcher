@@ -39,6 +39,7 @@
   "side_panel": {
     "default_path": "popup.html"
   },
+  "devtools_page": "devtools.html",
   "icons": {
     "16": "icons/icon16.svg",
     "48": "icons/icon48.svg",

@@ -67,7 +67,7 @@ class FakeWebSocket extends EventTarget {
   send() {}
 }
 
-function loadMainScript({ responder, fetchImpl = async () => new Response('ok') } = {}) {
+function loadMainScript({ responder, fetchImpl = async () => new Response('ok'), intercept = false, capturing = true } = {}) {
   class LocalXMLHttpRequest extends EventTarget {
     static networkCalls = 0;
 
@@ -109,6 +109,12 @@ function loadMainScript({ responder, fetchImpl = async () => new Response('ok') 
   const source = fs.readFileSync(path.join(projectRoot, 'content_script_main.js'), 'utf8');
   vm.runInContext(source, context, { filename: path.join(projectRoot, 'content_script_main.js') });
   window.emitMessage({ __netCatcherBridgeReady: true, nonce: 'test-bridge' });
+  window.emitMessage({
+    __netCatcherConfig: true,
+    hasActiveMockRules: intercept,
+    isCapturing: capturing,
+    nonce: 'test-bridge',
+  });
   return { context, window, XMLHttpRequest: LocalXMLHttpRequest };
 }
 
@@ -159,6 +165,7 @@ test('bridge forwards capture events and blocks page control commands', async ()
 test('fetch returns a real mock response without issuing the network request', async () => {
   let networkCalls = 0;
   const { window } = loadMainScript({
+    intercept: true,
     fetchImpl: async () => {
       networkCalls += 1;
       return new Response('network');
@@ -247,6 +254,7 @@ test('fetch captures a Request object body', async () => {
 
 test('XMLHttpRequest mock completes without issuing the network request', async () => {
   const { XMLHttpRequest } = loadMainScript({
+    intercept: true,
     responder: message => message.type === 'NET_REQUEST' ? {
       mocked: true,
       mockResponse: {
@@ -274,6 +282,7 @@ test('XMLHttpRequest mock completes without issuing the network request', async 
 
 test('XMLHttpRequest capture listeners do not leak when the object is reused', async () => {
   const { XMLHttpRequest, window } = loadMainScript({
+    intercept: true,
     responder: message => message.type === 'NET_REQUEST' ? {
       mocked: true,
       mockResponse: { status: 200, headers: {}, body: 'ok' },
@@ -732,4 +741,102 @@ test('page WebSocket binary sends a Base64 capture summary', () => {
   assert.equal(message.data.messageType, 'binary');
   assert.equal(message.data.dataSize, 3);
   assert.equal(message.data.dataHex, '01 02 03');
+});
+
+test('advanced rules return intercept plan and host map', async () => {
+  const { dispatch } = createBackgroundHarness();
+  const popupSender = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' };
+  const sender = { id: 'extension-id', tab: { id: 21 }, frameId: 0 };
+
+  await dispatch({ type: 'ADD_ADVANCED_RULE', data: {
+    kind: 'hostMap', name: 'test', pattern: 'api.prod.example', toHost: 'api.test.example', method: '*',
+  } }, popupSender);
+  await dispatch({ type: 'ADD_ADVANCED_RULE', data: {
+    kind: 'throttle', name: 'slow', pattern: '/users', method: 'GET', delayMs: 120, errorRate: 0,
+  } }, popupSender);
+  await dispatch({ type: 'ADD_ADVANCED_RULE', data: {
+    kind: 'mapLocal', name: 'local', pattern: '/local-json', method: 'GET',
+    status: 200, headers: { 'content-type': 'application/json' }, body: '{"mock":true}',
+  } }, popupSender);
+
+  const result = await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'adv-1', url: 'https://api.prod.example/users', method: 'GET', startTime: 1, type: 'fetch',
+  } }, sender);
+  assert.ok(result.intercept);
+  assert.equal(result.intercept.url, 'https://api.test.example/users');
+  assert.equal(result.intercept.throttle.delayMs, 120);
+
+  const local = await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'adv-2', url: 'https://example.test/local-json', method: 'GET', startTime: 2, type: 'fetch',
+  } }, sender);
+  assert.equal(local.intercept.mapLocal.body, '{"mock":true}');
+});
+
+test('rewrite rule mutates request plan', async () => {
+  const { dispatch } = createBackgroundHarness();
+  const popupSender = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' };
+  const sender = { id: 'extension-id', tab: { id: 22 }, frameId: 0 };
+  await dispatch({ type: 'ADD_ADVANCED_RULE', data: {
+    kind: 'rewrite', name: 'debug header', pattern: '/api/', method: '*',
+    headerOps: [{ op: 'set', name: 'x-debug', value: '1' }],
+    bodyReplacements: [{ find: '"debug":false', replace: '"debug":true' }],
+  } }, popupSender);
+  const result = await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'rw-1', url: 'https://example.test/api/me', method: 'POST',
+    requestHeaders: { 'content-type': 'application/json' },
+    requestBody: '{"debug":false}',
+    startTime: 1, type: 'fetch',
+  } }, sender);
+  assert.equal(result.intercept.rewrite.headers['x-debug'], '1');
+  assert.equal(result.intercept.rewrite.body, '{"debug":true}');
+});
+
+test('session package export/import restores rules and requests', async () => {
+  const { dispatch } = createBackgroundHarness();
+  const popupSender = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' };
+  const sender = { id: 'extension-id', tab: { id: 23 }, frameId: 0 };
+  await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'pkg-1', url: 'https://example.test/pkg', method: 'GET', startTime: 1, type: 'fetch',
+  } }, sender);
+  await dispatch({ type: 'ADD_ADVANCED_RULE', data: {
+    kind: 'script', name: 'noop', pattern: '/pkg', script: 'body',
+  } }, popupSender);
+  const exported = await dispatch({ type: 'EXPORT_SESSION_PACKAGE' }, popupSender);
+  assert.ok(exported.package.requests.length >= 1);
+  assert.equal(exported.package.scriptRules.length, 1);
+
+  const imported = await dispatch({ type: 'IMPORT_SESSION_PACKAGE', data: { package: exported.package } }, popupSender);
+  assert.equal(imported.ok, true);
+  const rules = await dispatch({ type: 'GET_ADVANCED_RULES' }, popupSender);
+  assert.equal(rules.scriptRules.length, 1);
+});
+
+test('breakpoint resume continues pending request', async () => {
+  const { dispatch } = createBackgroundHarness();
+  const popupSender = { id: 'extension-id', url: 'chrome-extension://extension-id/popup.html' };
+  const sender = { id: 'extension-id', tab: { id: 24 }, frameId: 0 };
+  await dispatch({ type: 'ADD_ADVANCED_RULE', data: {
+    kind: 'breakpoint', name: 'bp', pattern: '/hold', method: '*',
+  } }, popupSender);
+
+  const registered = await dispatch({ type: 'NET_REQUEST', data: {
+    captureId: 'bp-1', url: 'https://example.test/hold', method: 'GET', startTime: 1, type: 'fetch',
+  } }, sender);
+  assert.ok(registered.intercept.breakpointId);
+
+  const waitPromise = dispatch({
+    type: 'WAIT_BREAKPOINT',
+    data: { breakpointId: registered.intercept.breakpointId, captureId: 'bp-1', snapshot: { url: 'https://example.test/hold' } },
+  }, sender);
+
+  const pending = await dispatch({ type: 'GET_ADVANCED_RULES' }, popupSender);
+  assert.equal(pending.pendingBreakpoints.length, 1);
+
+  const resumed = await dispatch({
+    type: 'RESUME_BREAKPOINT',
+    data: { id: String(registered.intercept.breakpointId), action: 'continue' },
+  }, popupSender);
+  assert.equal(resumed.ok, true);
+  const waitResult = await waitPromise;
+  assert.equal(waitResult.action, 'continue');
 });

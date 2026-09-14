@@ -5,14 +5,20 @@
   'use strict';
 
   const MAX_CAPTURE_BODY_BYTES = 1024 * 1024;
-  const BRIDGE_TIMEOUT_MS = 250;
+  const BRIDGE_TIMEOUT_MS = 80;
   const pendingBridgeRequests = new Map();
   let fallbackId = 0;
-  let mockDecisionRequired = true;
+  // 默认不阻塞请求；等 bridge 配置后再决定是否走 mock/拦截路径
+  let mockDecisionRequired = false;
+  let capturingEnabled = true;
   let bridgeNonce = null;
   let bridgeNoncePromise = null;
   let bridgeNonceResolve = null;
   const wsInstances = new Map();
+
+  function shouldSkipCapture(url) {
+    return /^(chrome-extension|chrome|about|data|blob|devtools):/i.test(String(url || ''));
+  }
 
   function waitForBridgeNonce() {
     if (bridgeNonce) return Promise.resolve(bridgeNonce);
@@ -80,6 +86,7 @@
     if (event.data?.__netCatcherConfig) {
       if (event.data.nonce !== bridgeNonce) return;
       mockDecisionRequired = !!event.data.hasActiveMockRules;
+      capturingEnabled = event.data.isCapturing !== false;
       return;
     }
     if (event.data?.__netCatcher && event.data.type === 'WS_REPLAY') {
@@ -248,19 +255,30 @@
       input instanceof Request ? input.url : String(input);
     let url = rawUrl;
     try { url = new URL(rawUrl, window.location?.href).href; } catch {}
+
+    // 快速路径：暂停捕获或特殊协议时不做任何拦截/序列化
+    if (!capturingEnabled || shouldSkipCapture(url)) {
+      return originalFetch.apply(this, args);
+    }
+
     const method = (init.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
     const requestHeaders = normalizeHeaders(init.headers || (input instanceof Request ? input.headers : null));
     const captureId = createCaptureId('http');
     const startTime = now();
+    const hasBodyMethod = !['GET', 'HEAD'].includes(method);
 
-    let requestBody = await serializeRequestBody(init.body);
-    if (init.body === undefined && input instanceof Request && !['GET', 'HEAD'].includes(method)) {
-      try { requestBody = await input.clone().text(); } catch {}
+    let requestBody = null;
+    if (hasBodyMethod) {
+      requestBody = await serializeRequestBody(init.body);
+      if (init.body === undefined && input instanceof Request) {
+        try { requestBody = await input.clone().text(); } catch {}
+      }
     }
 
     const requestData = {
       captureId, url, method, requestHeaders, requestBody, startTime, type: 'fetch',
     };
+    // 仅在存在拦截规则时阻塞；否则 fire-and-forget，避免拖慢页面
     const registration = mockDecisionRequired ?
       await requestBridge('NET_REQUEST', requestData) : (sendToBridge('NET_REQUEST', requestData), null);
     if (registration?.mocked && registration.mockResponse) {
@@ -270,8 +288,69 @@
       return createMockResponse(url, registration.mockResponse);
     }
 
+    let fetchUrl = url;
+    let fetchInit = { ...init };
+    let fetchInput = input;
+    const intercept = registration?.intercept || null;
+
+    if (intercept?.breakpointId) {
+      const resume = await requestBridge('WAIT_BREAKPOINT', {
+        breakpointId: intercept.breakpointId,
+        captureId,
+        snapshot: { url, method, requestHeaders, requestBody },
+      });
+      if (resume?.action === 'abort') throw new TypeError('Request aborted by breakpoint');
+      if (resume?.options?.mock) {
+        return createMockResponse(url, resume.options.mock);
+      }
+      if (resume?.options) {
+        if (resume.options.url) fetchUrl = resume.options.url;
+        if (resume.options.method) fetchInit.method = resume.options.method;
+        if (resume.options.headers) fetchInit.headers = resume.options.headers;
+        if (resume.options.body !== undefined && resume.options.body !== null) fetchInit.body = resume.options.body;
+      }
+    }
+
+    if (intercept?.mapLocal) {
+      const delay = Math.max(0, Number(intercept.mapLocal.delay) || 0);
+      if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+      return createMockResponse(url, intercept.mapLocal);
+    }
+
+    if (intercept?.throttle) {
+      const delay = Math.max(0, Number(intercept.throttle.delayMs) || 0);
+      if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+      const rate = Number(intercept.throttle.errorRate) || 0;
+      if (rate > 0 && Math.random() < rate) throw new TypeError(intercept.throttle.errorMessage || 'Throttled network error');
+    }
+
+    if (intercept?.rewrite) {
+      if (intercept.rewrite.url) fetchUrl = intercept.rewrite.url;
+      if (intercept.rewrite.method) fetchInit.method = intercept.rewrite.method;
+      if (intercept.rewrite.headers) fetchInit.headers = intercept.rewrite.headers;
+      if (intercept.rewrite.body !== undefined && intercept.rewrite.body !== null &&
+          !['GET', 'HEAD'].includes(String(fetchInit.method || method).toUpperCase())) {
+        fetchInit.body = intercept.rewrite.body;
+      }
+    }
+
     try {
-      const response = await originalFetch.apply(this, args);
+      const fetchArgs = (fetchUrl !== url || fetchInit.method || fetchInit.headers || fetchInit.body)
+        ? [fetchUrl, fetchInit]
+        : args;
+      let response = await originalFetch.apply(this, fetchArgs);
+      if (intercept?.script?.script) {
+        try {
+          const text = await response.clone().text();
+          const fn = new Function('body', 'request', `${intercept.script.script}\n;return body;`);
+          const nextBody = String(fn(text, { url: fetchUrl, method, headers: requestHeaders }));
+          if (nextBody !== text) {
+            const headers = new Headers(response.headers);
+            headers.delete('content-length');
+            response = new Response(nextBody, { status: response.status, statusText: response.statusText, headers });
+          }
+        } catch {}
+      }
       const endTime = now();
       const responseHeaders = {};
       response.headers.forEach((value, name) => { responseHeaders[name] = value; });
@@ -517,8 +596,8 @@
       startTime: nc.startTime, type: 'xhr', allowMock: nc.async,
     };
 
-    if (!nc.async) {
-      sendToBridge('NET_REQUEST', requestData);
+    if (!nc.async || !capturingEnabled || shouldSkipCapture(nc.url)) {
+      if (capturingEnabled && !shouldSkipCapture(nc.url)) sendToBridge('NET_REQUEST', requestData);
       return originalSend.apply(this, [body]);
     }
 
@@ -527,7 +606,7 @@
       return originalSend.apply(this, [body]);
     }
 
-    requestBridge('NET_REQUEST', requestData).then(registration => {
+    requestBridge('NET_REQUEST', requestData).then(async registration => {
       if (nc.aborted) return;
       if (registration?.mocked && registration.mockResponse) {
         const delay = Math.max(0, Number(registration.mockResponse.delay) || 0);
@@ -546,9 +625,49 @@
           xhr.dispatchEvent(new Event('error'));
           cleanupXhrCapture(xhr, nc);
         } else completeMockXhr(xhr, nc, registration.mockResponse);
-      } else {
-        originalSend.apply(xhr, [body]);
+        return;
       }
+
+      const intercept = registration?.intercept || null;
+      if (intercept?.breakpointId) {
+        const resume = await requestBridge('WAIT_BREAKPOINT', {
+          breakpointId: intercept.breakpointId,
+          captureId: nc.captureId,
+          snapshot: { url: nc.url, method: nc.method, requestHeaders: nc.requestHeaders, requestBody: nc.requestBody },
+        });
+        if (nc.aborted) return;
+        if (resume?.action === 'abort') {
+          xhr.dispatchEvent(new Event('error'));
+          cleanupXhrCapture(xhr, nc);
+          return;
+        }
+        if (resume?.options?.mock) {
+          completeMockXhr(xhr, nc, resume.options.mock);
+          return;
+        }
+        if (resume?.options?.body !== undefined && resume.options.body !== null) {
+          body = resume.options.body;
+        }
+      }
+
+      if (intercept?.mapLocal) {
+        completeMockXhr(xhr, nc, intercept.mapLocal);
+        return;
+      }
+
+      if (intercept?.throttle) {
+        const delay = Math.max(0, Number(intercept.throttle.delayMs) || 0);
+        if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+        if (nc.aborted) return;
+        const rate = Number(intercept.throttle.errorRate) || 0;
+        if (rate > 0 && Math.random() < rate) {
+          xhr.dispatchEvent(new Event('error'));
+          cleanupXhrCapture(xhr, nc);
+          return;
+        }
+      }
+
+      originalSend.apply(xhr, [body]);
     }).catch(() => originalSend.apply(xhr, [body]));
   };
 

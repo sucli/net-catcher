@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NetCatcher</title>
+  <link rel="stylesheet" href="devtools_panel.css">
+</head>
+<body>
+  <header class="dt-top">
+    <div class="dt-brand">NetCatcher</div>
+    <div class="dt-tabs">
+      <button class="dt-tab active" data-scope="current">当前标签</button>
+      <button class="dt-tab" data-scope="all">全部</button>
+    </div>
+    <input id="dt-search" class="dt-input" placeholder="搜索 URL..." spellcheck="false">
+    <select id="dt-status" class="dt-select">
+      <option value="">状态</option>
+      <option value="2xx">2xx</option>
+      <option value="4xx">4xx</option>
+      <option value="5xx">5xx</option>
+      <option value="0">失败</option>
+    </select>
+    <button id="dt-compare" class="dt-btn">对比所选</button>
+    <button id="dt-clear-sel" class="dt-btn ghost">清空选择</button>
+    <span id="dt-count" class="dt-count">0</span>
+  </header>
+  <div class="dt-cols">
+    <span class="c-method">方法</span>
+    <span class="c-url">地址</span>
+    <span class="c-status">状态</span>
+    <span class="c-dur">耗时</span>
+    <span class="c-size">大小</span>
+  </div>
+  <main id="dt-list" class="dt-list">
+    <div class="dt-empty">等待请求… 在页面刷新或调用接口后出现</div>
+  </main>
+  <aside id="dt-detail" class="dt-detail" hidden>
+    <div class="dt-detail-head">
+      <span id="dt-detail-title">详情</span>
+      <button id="dt-detail-close" class="dt-btn ghost">关闭</button>
+    </div>
+    <div class="dt-detail-tabs">
+      <button class="dtab active" data-dtab="headers">Headers</button>
+      <button class="dtab" data-dtab="req">请求体</button>
+      <button class="dtab" data-dtab="res">响应体</button>
+    </div>
+    <div id="dt-detail-body" class="dt-detail-body"></div>
+  </aside>
+  <div id="dt-compare-panel" class="dt-compare" hidden>
+    <div class="dt-compare-head">
+      <span>请求对比</span>
+      <div class="dt-compare-tabs">
+        <button class="ctab active" data-ctab="overview">概览</button>
+        <button class="ctab" data-ctab="headers">Headers</button>
+        <button class="ctab" data-ctab="json">JSON 路径</button>
+        <button class="ctab" data-ctab="text">文本 Diff</button>
+      </div>
+      <button id="dt-compare-close" class="dt-btn ghost">关闭</button>
+    </div>
+    <div id="dt-compare-body" class="dt-compare-body"></div>
+  </div>
+  <script src="devtools_panel.js"></script>
+</body>
+</html>
